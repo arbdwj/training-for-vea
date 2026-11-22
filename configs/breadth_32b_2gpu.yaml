@@ -1,0 +1,75 @@
+# 32B breadth test sized for a 2-GPU slot (fits the plentiful `mix` nodes -> schedules fast,
+# unlike the scarce fully-free 4-GPU nodes). Same 5 k-rungs x ~20 steps as breadth_32b_fast,
+# but 1 learner + 1 vLLM engine instead of 3+1, and an FP8 Nemotron judge at TP=2.
+#
+# Trade-off vs the 4-GPU config: only 1 learner (no data-parallel), so each training step is
+# slower -- but it STARTS now instead of waiting for a 4-GPU node. ZeRO-3 offloads the 32B's
+# params/optimizer to the Grace CPU (~480GB); the lone learner GPU holds activations
+# (gradient-checkpointed, 2048-token responses) and the vLLM engine holds the 32B (bf16 ~64GB < 97GB).
+#
+# Submit overriding the sbatch's GPU count:
+#   sbatch --gpus=2 scripts/run_e2e.sbatch configs/breadth_32b_2gpu.yaml
+# (add --partition=interactive if workq won't place a 2-GPU job)
+name: breadth_32b_2gpu
+backend: local
+output_dir: runs/breadth_32b_2gpu
+
+model:                               # STAGE 1 — all 5 rungs, ~20 steps each, on 2 GPUs
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-32B-Think-DPO
+  finetune: full_ft
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: [1, 2, 3, 4, 5]}     # the full breadth sweep -> 5 checkpoints
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 2.0e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 16
+    response_length: 2048
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 20
+    save_steps: 20
+  cluster:                           # 2-GPU split: 1 learner + 1 vLLM engine
+    deepspeed_stage: 3               # ZeRO-3 + CPU offload (Grace holds 32B optimizer+params)
+    num_learners: 1
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1
+    gradient_checkpointing: true
+    attn: sdpa                       # -> rendered as --attn_implementation torch
+  backend: {type: local, gpus: 2}
+
+eval:                                # STAGE 2 — all 5 ckpts x k=1..5, 32B at TP=2
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 2, 3, 4, 5]}
+      n_per_bucket: 20
+  generation:
+    rollouts: 4
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 2048
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 2, tensor_parallel: 2}
+
+judge:                               # STAGE 3 — Nemotron-120B auditor, FP8 at TP=2 (fits 2 GPUs)
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8
+      provider: vllm
+      opts: {tensor_parallel: 2, max_model_len: 12000}
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]
