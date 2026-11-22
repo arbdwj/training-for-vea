@@ -2213,8 +2213,12 @@ def main(
     # uses via OPEN_INSTRUCT_RAY_NUM_CPUS so it prestarts only that many workers. Must be >=
     # the actors' total CPU request (3 learners*4 + data_prep 2 + manager 1 + vLLM). Unset = default.
     _oi_ray_num_cpus = os.environ.get("OPEN_INSTRUCT_RAY_NUM_CPUS")
+    # vea-fork: the Ray dashboard (MetricsHead subprocess) fails to start on this aarch64/GH200
+    # stack and isn't needed for training; disable it unless OPEN_INSTRUCT_RAY_DASHBOARD=1.
+    _oi_ray_dashboard = os.environ.get("OPEN_INSTRUCT_RAY_DASHBOARD", "0") == "1"
     ray.init(
         num_cpus=int(_oi_ray_num_cpus) if _oi_ray_num_cpus else None,
+        include_dashboard=_oi_ray_dashboard,
         runtime_env={
             "excludes": [".git/"],
             "env_vars": {k: v for k, v in os.environ.items() if k not in EXCLUDED_ENV_VARS},
