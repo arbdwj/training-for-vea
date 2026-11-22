@@ -65,6 +65,17 @@ if [ -x "$VENV/bin/python" ]; then
   else
     "$VENV/bin/python" -m pip install -q $DEPS || true
   fi
+
+  # flash-attn-4 (FA4 beta) installs a `flash_attn` namespace WITHOUT ops.triton.rotary, which
+  # makes vLLM's unguarded get_rope import crash (ModuleNotFoundError: flash_attn.ops). vLLM uses
+  # its OWN bundled flash-attn for attention, so remove FA4 -> vLLM falls back to native rotary.
+  if "$VENV/bin/python" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('flash_attn') else 1)" 2>/dev/null; then
+    if ! "$VENV/bin/python" -c "import flash_attn.ops.triton.rotary" 2>/dev/null; then
+      echo "== removing broken flash-attn (FA4 namespace w/o ops) so vLLM uses native rotary ..."
+      (command -v uv >/dev/null && uv pip uninstall --python "$VENV/bin/python" flash-attn-4 flash-attn flash_attn) \
+        || "$VENV/bin/python" -m pip uninstall -y flash-attn-4 flash-attn flash_attn || true
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------------------
