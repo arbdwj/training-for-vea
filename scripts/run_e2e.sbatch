@@ -41,6 +41,10 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TMPDIR:-/tmp}/triton_$USER}"; mkd
 echo "CUDA_HOME=${CUDA_HOME:-UNSET}  nvcc=$(command -v nvcc || echo none)"
 [ -z "${CUDA_HOME:-}" ] && echo "!! CUDA_HOME unset — DeepSpeed will fail. Set CUDA_MODULE=<module> (module avail cuda)."
 
+# Ray needs a high open-file limit (default 4000 here starves its sockets -> raylet/worker EOF).
+ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+echo "open-file limit (ulimit -n) = $(ulimit -n)"
+
 run() { echo "=== STAGE $1  ($(date '+%H:%M:%S')) ==="; python scripts/run.py run "$CONFIG" "${@:2}"; }
 
 run model --stages model --backend local || { echo "!! model stage failed"; exit 1; }
