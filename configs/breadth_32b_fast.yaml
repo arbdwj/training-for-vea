@@ -1,0 +1,76 @@
+# FAST breadth plumbing test: ALL 5 k-rungs (k=1..5), ~20 steps each, minimal budget.
+# Purpose: validate the parallel-breadth train->eval->judge orchestration end-to-end
+# (NOT to get real 32B science — 20 steps is plumbing only).
+#
+# TIMING REALITY: the 5 rungs train SEQUENTIALLY on one 4-GPU node (32B uses all 4 GPUs),
+# each paying a ~4-5 min load/shard cost + training, then a 5-ckpt eval + a 120B judge load.
+# -> expect ~1.5-2.5 h on 32B. To actually land UNDER 1 HOUR, change `base` to the 7B line
+#    below (same orchestration, far faster load+train); this run is about plumbing, so 7B
+#    proves the identical path.
+#
+#   python scripts/run.py run configs/breadth_32b_fast.yaml --stages model --backend local
+#   python scripts/run.py run configs/breadth_32b_fast.yaml --stages eval  --backend local
+#   python scripts/run.py run configs/breadth_32b_fast.yaml --stages judge
+name: breadth_32b_fast
+backend: local
+output_dir: runs/breadth_32b_fast
+
+model:                               # STAGE 1 — all 5 rungs, ~20 steps each
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-32B-Think-DPO      # <- for <1h plumbing: allenai/Olmo-3-7B-Think-DPO
+  finetune: full_ft
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: [1, 2, 3, 4, 5]}     # the full breadth sweep -> 5 checkpoints
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 2.0e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 16   # smaller batch -> faster steps
+    response_length: 2048            # short gen -> fast steps (plumbing, not real length)
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 20                    # ~20 steps per rung
+    save_steps: 20
+  cluster:
+    deepspeed_stage: 3
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1
+    gradient_checkpointing: true
+    attn: sdpa
+  backend: {type: local, gpus: 4}
+
+eval:                                # STAGE 2 — small eval, all 5 ckpts x k=1..5
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 2, 3, 4, 5]}
+      n_per_bucket: 20
+  generation:
+    rollouts: 4
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 2048
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 4, tensor_parallel: 2}
+
+judge:                               # STAGE 3 — Nemotron-120B auditor (local, no API key)
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+      provider: vllm
+      opts: {tensor_parallel: 4, max_model_len: 12000}   # short rollouts -> smaller ctx ok
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]
