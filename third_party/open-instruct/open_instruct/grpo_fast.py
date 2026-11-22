@@ -590,6 +590,16 @@ class PolicyTrainerRayProcess(RayProcess):
             self.model(input_ids=input_ids)
 
     def broadcast_to_vllm(self, model_step: int):
+        # vea-fork DIAGNOSTIC: VEA_SKIP_VLLM_SYNC=1 skips the weight TRANSFER entirely, so vLLM keeps
+        # the real base checkpoint it loaded at init (correct at step 0; off-policy after). Used to
+        # bisect whether the hang is our LoRA->vLLM weight update vs. the generation/queue path itself.
+        if os.environ.get("VEA_SKIP_VLLM_SYNC"):
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.warning(
+                    "VEA_SKIP_VLLM_SYNC set: skipping vLLM weight sync at step %s (vLLM stays at base). "
+                    "DIAGNOSTIC/timing only — training is off-policy.", model_step,
+                )
+            return []
         # avoid OOM
         torch.cuda.empty_cache()
         # Ensure CUDA device is set before broadcast operations.
