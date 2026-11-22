@@ -122,4 +122,22 @@ def run_local(stage: EvalStage, model_path: str, model_label: str, prompts_path:
                           ds.name if ds.bucket_by != "k" else "if", b, progress_cb=cb)
             if store is not None:
                 store.update(tid, status="done")
+    _free_vllm(llm)
     return str(out_dir)
+
+
+def _free_vllm(llm):
+    """Release the vLLM engine + GPU memory so a later in-process model can load."""
+    try:
+        import contextlib
+        import gc
+
+        import torch
+        del llm
+        with contextlib.suppress(Exception):
+            from vllm.distributed.parallel_state import destroy_model_parallel
+            destroy_model_parallel()
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass

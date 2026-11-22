@@ -1,0 +1,69 @@
+# Direct 32B e2e TEST on the 4xGH200 node: ~100 OlmoRL steps -> eval -> Nemotron-120B judge.
+# Run the stages as SEPARATE processes so each frees its GPU memory before the next
+# (32B train, then 32B eval, then a 120B judge all in one process would OOM):
+#   python scripts/run.py run configs/e2e_32b.yaml --stages model --backend local
+#   python scripts/run.py run configs/e2e_32b.yaml --stages eval  --backend local
+#   python scripts/run.py run configs/e2e_32b.yaml --stages judge
+name: e2e_32b
+backend: local
+output_dir: runs/e2e_32b
+
+model:                               # STAGE 1 — ~100-step OlmoRL run on 32B (single k=3 rung)
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-32B-Think-DPO
+  finetune: full_ft
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: 3}                   # single rung for the test (no sweep)
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 2.0e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 32
+    response_length: 8192            # the real 8k budget; drop to 4096 if OOM on 4 GPUs
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 100                   # TEST length (-> total_episodes auto-derived)
+    save_steps: 100
+  cluster:                           # 4xGH200 split: 3 learners + 1 vLLM engine
+    deepspeed_stage: 3               # ZeRO-3 + CPU offload (Grace ~480GB holds optimizer+params)
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1     # if the engine OOMs, set 2 (then num_learners: 2)
+    gradient_checkpointing: true
+    attn: sdpa                       # aarch64: no flash-attn
+  backend: {type: local, gpus: 4}
+
+eval:                                # STAGE 2 — eval the trained 32B across complexities
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 3, 5]}
+      n_per_bucket: 50
+  generation:
+    rollouts: 8
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 8192
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 4, tensor_parallel: 2}   # 32B eval on 2 GPUs
+
+judge:                               # STAGE 3 — Nemotron-3 Super 120B auditor, local (no API key)
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16   # 120B-total/12B-active hybrid MoE
+      provider: vllm
+      opts: {tensor_parallel: 4, max_model_len: 24000}        # BF16 ~240GB -> TP=4 on 4xGH200
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]
