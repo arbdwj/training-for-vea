@@ -33,7 +33,9 @@ def _rung_label(ms, rung: dict) -> str:
 def plan_training(cfg: PipelineCfg):
     """Return [(label, filter, argv, warnings, data_path, out_dir)] for each rung."""
     ms = cfg.model
-    out_root = Path(cfg.output_dir)
+    # Absolute: grpo_fast.py runs with cwd=third_party/open-instruct, so relative dataset/
+    # output paths would resolve under there instead of the repo root where we write the data.
+    out_root = Path(cfg.output_dir).resolve()
     jobs = []
     for rung in ms.rungs():
         label = _rung_label(ms, rung)
