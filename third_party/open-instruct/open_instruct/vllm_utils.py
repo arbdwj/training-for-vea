@@ -948,7 +948,13 @@ async def _acquire_and_reset_pools(
 
 async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_params: SamplingConfig):
     """Process a single async request with tool/environment support."""
-    await _check_health(actor.server_port)
+    logger.info(f"[VEA process_request] {sub_request_id}: START, checking health at port {actor.server_port}")
+    try:
+        await _check_health(actor.server_port)
+    except Exception as e:
+        logger.error(f"[VEA process_request] {sub_request_id}: HEALTH CHECK FAILED: {type(e).__name__}: {e}")
+        raise
+    logger.info(f"[VEA process_request] {sub_request_id}: health OK")
 
     response_tokens: list[int] = []
     response_logprobs: list[float] = []
@@ -1006,6 +1012,10 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             current_sampling_params = dataclasses.replace(sampling_params, max_tokens=current_max_tokens)
             params_dict = dataclasses.asdict(current_sampling_params)
             min_tokens = params_dict.pop("min_tokens", 0)
+            logger.info(
+                f"[VEA process_request] {sub_request_id}: POST completions.create "
+                f"prompt_len={len(current_prompt)} max_tokens={current_max_tokens} (awaiting vLLM server...)"
+            )
             api_response = await actor.client.completions.create(
                 model=actor.model_name,
                 prompt=current_prompt,
@@ -1020,6 +1030,10 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             )
 
             output = api_response.choices[0]
+            logger.info(
+                f"[VEA process_request] {sub_request_id}: GOT RESPONSE, "
+                f"{len(list(output.token_ids))} tokens, text_len={len(output.text or '')}"
+            )
             model_tokens = list(output.token_ids)
             response_tokens.extend(model_tokens)
             current_prompt.extend(model_tokens)
