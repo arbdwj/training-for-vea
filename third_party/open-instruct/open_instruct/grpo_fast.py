@@ -2224,8 +2224,14 @@ def main(
     # vea-fork: the Ray dashboard (MetricsHead subprocess) fails to start on this aarch64/GH200
     # stack and isn't needed for training; disable it unless OPEN_INSTRUCT_RAY_DASHBOARD=1.
     _oi_ray_dashboard = os.environ.get("OPEN_INSTRUCT_RAY_DASHBOARD", "0") == "1"
+    # vea-fork: by default Ray reserves ~30% of system RAM for its object store (seen as 200GB on a
+    # GH200 node). For CPU-offloaded large-model training that competes with the optimizer's host
+    # buffers and triggers the OOM killer. Cap it via OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY (bytes)
+    # to free host RAM for the optimizer. Unset = Ray default.
+    _oi_ray_osm = os.environ.get("OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY")
     ray.init(
         num_cpus=int(_oi_ray_num_cpus) if _oi_ray_num_cpus else None,
+        object_store_memory=int(_oi_ray_osm) if _oi_ray_osm else None,
         include_dashboard=_oi_ray_dashboard,
         runtime_env={
             "excludes": [".git/"],

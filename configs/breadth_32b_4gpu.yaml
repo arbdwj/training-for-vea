@@ -1,0 +1,79 @@
+# 32B breadth test on a FULL 4-GPU node: 3 learners + 1 vLLM engine.
+#
+# Memory strategy (vs the 2-GPU config that OOM-killed the host):
+#   - params/grads stay ON-GPU, SHARDED across the 3 learners (ZeRO-3, NO param offload):
+#     ~64GB params + ~64GB grads split 3 ways = ~43GB/GPU + grad-checkpointed activations < 97GB.
+#   - ONLY the optimizer (fp32 Adam states, ~384GB for 32B) offloads to the Grace CPU.
+#   - Ray's object store is capped (sbatch sets OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY=30GB) so it
+#     doesn't eat the ~200GB it grabs by default. With `--mem=0`, host use ~384+~40 < ~480GB node.
+# This is the best single-node shot at 32B; if it still OOMs, single-node 32B is infeasible here
+# and the real sweep needs multiple nodes (ZeRO-3 shards the optimizer across nodes' RAM too).
+#
+# Submit (sbatch already requests 4 GPUs + all node memory):
+#   sbatch scripts/run_e2e.sbatch configs/breadth_32b_4gpu.yaml
+name: breadth_32b_4gpu
+backend: local
+output_dir: runs/breadth_32b_4gpu
+
+model:                               # STAGE 1 — all 5 rungs, ~20 steps each, on 4 GPUs
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-32B-Think-DPO
+  finetune: full_ft
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: [1, 2, 3, 4, 5]}     # the full breadth sweep -> 5 checkpoints
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 2.0e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 16
+    response_length: 2048
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 20
+    save_steps: 20
+  cluster:                           # 4-GPU split: 3 learners + 1 vLLM engine
+    deepspeed_stage: 3               # ZeRO-3: shard params/grads across the 3 learner GPUs
+    deepspeed_offload_param: false   # KEEP params on GPU (sharded) — only ~43GB/GPU across 3 learners
+    deepspeed_offload_optimizer: true #  offload ONLY the fp32 optimizer (~384GB) to Grace CPU
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1
+    gradient_checkpointing: true
+    attn: sdpa                       # -> rendered as --attn_implementation torch
+    vllm_enforce_eager: true         # skip torch.compile + CUDA-graph capture (1200s init timeout)
+  backend: {type: local, gpus: 4}
+
+eval:                                # STAGE 2 — all 5 ckpts x k=1..5, 32B at TP=4 (full node)
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 2, 3, 4, 5]}
+      n_per_bucket: 20
+  generation:
+    rollouts: 4
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 2048
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 4, tensor_parallel: 4}
+
+judge:                               # STAGE 3 — Nemotron-120B auditor, FP8 at TP=4 (full node)
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8
+      provider: vllm
+      opts: {tensor_parallel: 4, max_model_len: 12000}
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]

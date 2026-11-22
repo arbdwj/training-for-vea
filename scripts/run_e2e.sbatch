@@ -15,7 +15,7 @@
 ## ---- set these for your cluster (uncomment / edit) ----
 ## #SBATCH --partition=gpu
 ## #SBATCH --account=YOUR_ACCOUNT
-## #SBATCH --mem=0            # all node memory (Grace LPDDR for ZeRO offload)
+#SBATCH --mem=0             # all node memory (Grace LPDDR for ZeRO/CPUAdam offload) — essential
 
 set -uo pipefail
 CONFIG="${1:-configs/breadth_32b_fast.yaml}"
@@ -90,7 +90,10 @@ ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 # the per-user process limit (raylet EAGAIN crash). Cap Ray's CPUs (>= actors' need ~20).
 ulimit -u 65536 2>/dev/null || ulimit -u "$(ulimit -Hu)" 2>/dev/null || true
 export OPEN_INSTRUCT_RAY_NUM_CPUS="${OPEN_INSTRUCT_RAY_NUM_CPUS:-32}"
-echo "ulimit -n=$(ulimit -n)  ulimit -u=$(ulimit -u)  OPEN_INSTRUCT_RAY_NUM_CPUS=$OPEN_INSTRUCT_RAY_NUM_CPUS"
+# Cap Ray's object store (default ~30% of RAM = ~200GB on a GH200 node) so it doesn't compete with
+# the CPU-offloaded optimizer's host buffers and trip the OOM killer. 30GB is plenty for rollouts.
+export OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY="${OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY:-30000000000}"
+echo "ulimit -n=$(ulimit -n)  ulimit -u=$(ulimit -u)  OPEN_INSTRUCT_RAY_NUM_CPUS=$OPEN_INSTRUCT_RAY_NUM_CPUS  RAY_OSM=$OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY"
 
 run() { echo "=== STAGE $1  ($(date '+%H:%M:%S')) ==="; python scripts/run.py run "$CONFIG" "${@:2}"; }
 

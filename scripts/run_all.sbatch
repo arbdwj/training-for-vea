@@ -84,7 +84,9 @@ ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 # the per-user process limit (raylet EAGAIN crash). Cap Ray's CPUs (>= actors' need ~20).
 ulimit -u 65536 2>/dev/null || ulimit -u "$(ulimit -Hu)" 2>/dev/null || true
 export OPEN_INSTRUCT_RAY_NUM_CPUS="${OPEN_INSTRUCT_RAY_NUM_CPUS:-32}"
-echo "ulimit -n=$(ulimit -n)  ulimit -u=$(ulimit -u)  OPEN_INSTRUCT_RAY_NUM_CPUS=$OPEN_INSTRUCT_RAY_NUM_CPUS"
+# Cap Ray's object store (default ~200GB on GH200) so it doesn't starve the CPU-offloaded optimizer.
+export OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY="${OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY:-30000000000}"
+echo "ulimit -n=$(ulimit -n)  ulimit -u=$(ulimit -u)  OPEN_INSTRUCT_RAY_NUM_CPUS=$OPEN_INSTRUCT_RAY_NUM_CPUS  RAY_OSM=$OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY"
 
 # 2. pipeline (separate processes so each frees its GPUs before the next)
 stage() { echo "########## STAGE $1  $(date) ##########"; python scripts/run.py run "$CONFIG" "${@:2}"; }
