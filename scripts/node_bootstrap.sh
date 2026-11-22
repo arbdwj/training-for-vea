@@ -24,12 +24,16 @@ fi
 # 1. open-instruct env (uv preferred; it knows the aarch64 markers in uv.lock)
 # ---------------------------------------------------------------------------
 cd "$OI"
+# We vendored open-instruct WITHOUT its .git, so setuptools-scm can't derive a version
+# at build time -> give it one explicitly (the build fails otherwise).
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPEN_INSTRUCT="${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPEN_INSTRUCT:-0.1.0}"
+export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION:-0.1.0}"   # belt-and-braces
 # open-instruct declares cuda12 (default) and cuda13 as CONFLICTING groups, so selecting
 # cuda13 requires dropping cuda12. GH200/aarch64 torch uses the cu130 index -> cuda13 default.
 # Override with CUDA_GROUP=cuda12 for a CUDA-12 node. Check your driver: nvidia-smi (top-right).
 CUDA_GROUP="${CUDA_GROUP:-cuda13}"
 if command -v uv >/dev/null; then
-  echo "== uv sync (open-instruct, group=$CUDA_GROUP; flash-attn auto-skipped on aarch64) ..."
+  echo "== uv sync (open-instruct, group=$CUDA_GROUP, scm_version=$SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPEN_INSTRUCT) ..."
   if [ "$CUDA_GROUP" = "cuda13" ]; then
     uv sync --no-group cuda12 --group cuda13 \
       || { echo "!! cuda13 sync failed; falling back to default (cuda12)"; uv sync; } \
@@ -44,12 +48,23 @@ else
   VENV="$OI/.venv"
 fi
 
+# ensure the venv exists even if uv sync bailed, so pip-based fallback/deps still work
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "== creating venv ($VENV) for fallback install ..."
+  (command -v uv >/dev/null && uv venv "$VENV") || python3.12 -m venv "$VENV" || python3 -m venv "$VENV"
+fi
+
 # ---------------------------------------------------------------------------
 # 2. our pipeline deps into the same env
 # ---------------------------------------------------------------------------
-if [ -d "$VENV" ]; then
+if [ -x "$VENV/bin/python" ]; then
   echo "== installing pipeline deps into $VENV ..."
-  "$VENV/bin/pip" install -q pyyaml rich anthropic openai datasets huggingface-hub || true
+  DEPS="pyyaml rich anthropic openai datasets huggingface-hub"
+  if command -v uv >/dev/null; then
+    uv pip install --python "$VENV/bin/python" -q $DEPS || true
+  else
+    "$VENV/bin/python" -m pip install -q $DEPS || true
+  fi
 fi
 
 # ---------------------------------------------------------------------------
