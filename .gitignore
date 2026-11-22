@@ -12,6 +12,10 @@ env/
 .pytest_cache/
 .ruff_cache/
 
+# Logs
+logs/
+*.log
+
 # Runs / outputs / weights
 runs/
 outputs/
