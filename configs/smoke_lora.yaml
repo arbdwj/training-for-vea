@@ -1,0 +1,71 @@
+# FAST smoke of the 32B LoRA-RL path — same model/LoRA/sync/memory as breadth_32b_lora, but a
+# trivially small rollout so a full step completes in ~1-2 min (vs ~15 min). Use this to debug the
+# train loop + the LoRA->vLLM weight sync; switch back to breadth_32b_lora.yaml for the real numbers.
+#   srun --gpus=4 --cpus-per-task=64 bash -c 'cd ~/vea_complexity/training-for-vea && source scripts/setup_env.sh && python scripts/run.py run configs/smoke_lora.yaml --stages model --backend local'
+name: smoke_lora
+backend: local
+output_dir: runs/smoke_lora
+
+model:
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-32B-Think-DPO
+  finetune: lora
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: [1]}                   # ONE rung only (not the 5-way sweep) — one adapter
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 1.0e-5
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 4  # tiny group
+    num_unique_prompts_rollout: 4      # 4 prompts x 4 = 16 generations total
+    response_length: 128               # short -> rollout finishes in seconds even in eager mode
+    max_prompt_token_length: 512
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 3                        # enough to see the per-step weight sync land >1x
+    save_steps: 3
+  cluster:                             # identical topology/memory to the real config
+    deepspeed_stage: 2
+    deepspeed_offload_param: false
+    deepspeed_offload_optimizer: false
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1
+    gradient_checkpointing: true
+    attn: sdpa
+    vllm_enforce_eager: true
+    lora: {r: 16, alpha: 32, dropout: 0.05}
+  backend: {type: local, gpus: 4}
+
+eval:                                  # unused with --stages model, but must validate
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1]}
+      n_per_bucket: 4
+  generation:
+    rollouts: 2
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 128
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 4, tensor_parallel: 4}
+
+judge:
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8
+      provider: vllm
+      opts: {tensor_parallel: 4, max_model_len: 12000}
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]

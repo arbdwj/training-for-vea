@@ -1470,6 +1470,12 @@ def broadcast_weights_to_vllm(
         refs = []
 
     params = list(model.named_parameters())
+    # vea-fork: drop params the name_mapper skips (returns None) BEFORE batching — e.g. merged-away LoRA
+    # adapter params. The metadata above already excludes them, so leaving them here would create an
+    # empty send per adapter param and desync the trainer<->vLLM send/recv count (the collective wedges
+    # and generation never starts). Filtering keeps exactly N sends for the N advertised names.
+    if name_mapper is not None:
+        params = [(n, p) for n, p in params if name_mapper(n) is not None]
     deepspeed_stage_3 = any(hasattr(p, "ds_id") for p in model.parameters())
 
     if isinstance(model, FSDP):
