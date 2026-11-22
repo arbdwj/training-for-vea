@@ -66,6 +66,14 @@ if [ -z "${CC:-}" ]; then for c in gcc-12 gcc-13 gcc gcc-14 gcc-11 gcc-10; do
     v="$("$p" -dumpversion 2>/dev/null | cut -d. -f1)"
     if [ -n "$v" ] && [ "$v" -ge 9 ] 2>/dev/null; then export CC="$p"; break; fi
   done; fi
+# HPC SDK math libs (curand/...) live in math_libs/<ver>, not cuda/<ver>/lib64; add to link+runtime paths.
+if [ -n "${CUDA_HOME:-}" ]; then
+  _ml="$(dirname "$(dirname "$CUDA_HOME")")/math_libs/$(basename "$CUDA_HOME")/lib64"
+  [ -e "$_ml/libcurand.so" ] || _ml="$(dirname "$(find /opt/nvidia/hpc_sdk -name 'libcurand.so*' 2>/dev/null | head -1)" 2>/dev/null)"
+  if [ -n "$_ml" ] && [ -d "$_ml" ]; then
+    export LIBRARY_PATH="$_ml:${LIBRARY_PATH:-}"; export LD_LIBRARY_PATH="$_ml:${LD_LIBRARY_PATH:-}"
+  fi
+fi
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TMPDIR:-/tmp}/triton_$USER}"; mkdir -p "$TRITON_CACHE_DIR" 2>/dev/null || true
 echo "CUDA_HOME=${CUDA_HOME:-UNSET}  nvcc=$(command -v nvcc || echo none)"
 [ -z "${CUDA_HOME:-}" ] && echo "!! CUDA_HOME unset — DeepSpeed will fail. Set CUDA_MODULE=<module> (module avail cuda)."
