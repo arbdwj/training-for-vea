@@ -51,7 +51,11 @@ echo "CUDA_HOME=${CUDA_HOME:-UNSET}  nvcc=$(command -v nvcc || echo none)"
 
 # Ray needs a high open-file limit (default 4000 here starves its sockets -> raylet/worker EOF).
 ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
-echo "open-file limit (ulimit -n) = $(ulimit -n)"
+# ...and a bounded worker count: Ray prestarts ~1 worker/CPU; on a 64+ core node that can exceed
+# the per-user process limit (raylet EAGAIN crash). Cap Ray's CPUs (>= actors' need ~20).
+ulimit -u 65536 2>/dev/null || ulimit -u "$(ulimit -Hu)" 2>/dev/null || true
+export OPEN_INSTRUCT_RAY_NUM_CPUS="${OPEN_INSTRUCT_RAY_NUM_CPUS:-32}"
+echo "ulimit -n=$(ulimit -n)  ulimit -u=$(ulimit -u)  OPEN_INSTRUCT_RAY_NUM_CPUS=$OPEN_INSTRUCT_RAY_NUM_CPUS"
 
 # 2. pipeline (separate processes so each frees its GPUs before the next)
 stage() { echo "########## STAGE $1  $(date) ##########"; python scripts/run.py run "$CONFIG" "${@:2}"; }

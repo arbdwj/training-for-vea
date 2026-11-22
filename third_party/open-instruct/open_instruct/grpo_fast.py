@@ -2207,11 +2207,18 @@ def main(
     beaker_config, wandb_url = setup_experiment_tracking(args, tc, model_config, streaming_config, vllm_config)
 
     # We have to initialize ray earlier for constructing Tools (they are implemented as ray actors).
+    # vea-fork: Ray prestarts ~one worker per detected CPU (64+ on GH200 nodes), which can
+    # blow past a low per-user process limit (RLIMIT_NPROC) and crash the raylet with EAGAIN
+    # ("Failed to start worker: Resource temporarily unavailable"). Cap the logical CPUs Ray
+    # uses via OPEN_INSTRUCT_RAY_NUM_CPUS so it prestarts only that many workers. Must be >=
+    # the actors' total CPU request (3 learners*4 + data_prep 2 + manager 1 + vLLM). Unset = default.
+    _oi_ray_num_cpus = os.environ.get("OPEN_INSTRUCT_RAY_NUM_CPUS")
     ray.init(
+        num_cpus=int(_oi_ray_num_cpus) if _oi_ray_num_cpus else None,
         runtime_env={
             "excludes": [".git/"],
             "env_vars": {k: v for k, v in os.environ.items() if k not in EXCLUDED_ENV_VARS},
-        }
+        },
     )
 
     pool_size = tools_config.pool_size
