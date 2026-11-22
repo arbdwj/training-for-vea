@@ -101,6 +101,11 @@ def render(ms: ModelStage, *, data_path: str, output_dir: str, exp_name: str,
         pl = int(p.get("max_prompt_token_length", 2048))
         argv += ["--pack_length", str(rl + pl + 1024)]
 
+    # This pipeline never pushes checkpoints to the HF Hub (open-instruct defaults push_to_hub=True,
+    # which calls whoami() at startup and hard-fails without HF auth). Checkpoints stay local.
+    if not p.get("push_to_hub"):
+        argv += ["--push_to_hub", "false"]
+
     for key, flag in _PARAM_FLAG.items():
         if key in p and p[key] is not None:
             argv += [flag, str(p[key])]
