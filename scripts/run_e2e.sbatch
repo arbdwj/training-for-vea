@@ -30,6 +30,17 @@ source third_party/open-instruct/.venv/bin/activate || { echo "!! run node_boots
 export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
+# --- CUDA toolkit for DeepSpeed (needs CUDA_HOME/nvcc at import) ------------
+# Set CUDA_MODULE=<your cluster's module> to pin it; else we try common names.
+module load "${CUDA_MODULE:-cuda}" 2>/dev/null \
+  || module load cuda/13.0 2>/dev/null || module load cuda/12.4 2>/dev/null || true
+if [ -z "${CUDA_HOME:-}" ] && command -v nvcc >/dev/null; then
+  export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+fi
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TMPDIR:-/tmp}/triton_$USER}"; mkdir -p "$TRITON_CACHE_DIR" 2>/dev/null || true
+echo "CUDA_HOME=${CUDA_HOME:-UNSET}  nvcc=$(command -v nvcc || echo none)"
+[ -z "${CUDA_HOME:-}" ] && echo "!! CUDA_HOME unset — DeepSpeed will fail. Set CUDA_MODULE=<module> (module avail cuda)."
+
 run() { echo "=== STAGE $1  ($(date '+%H:%M:%S')) ==="; python scripts/run.py run "$CONFIG" "${@:2}"; }
 
 run model --stages model --backend local || { echo "!! model stage failed"; exit 1; }
