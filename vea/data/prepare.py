@@ -107,6 +107,38 @@ def prepare_rung(name: str, k_filter: dict, out_path: str | Path, *, verifier: s
     return {"path": str(out_path), "n": n, "k": k}
 
 
+def sample_eval_prompts(name: str, out_path: str | Path, *, buckets=(1, 2, 3, 4, 5),
+                        n_per_bucket: int = 100, split: str = "train", seed: int = 0) -> dict:
+    """Build a local eval-prompt JSONL from Dolci-IF: {prompt_id, prompt, k, domain}.
+
+    Deterministic per-k sampling so eval/judge are reproducible. prompt_id is stable
+    (f"if_k{k}_{i}") so a judge can look prompts back up by id.
+    """
+    import random
+    ds = load_dolci_if(name, split)
+    by_k: dict[int, list[dict]] = {b: [] for b in buckets}
+    for row in ds:
+        k = constraint_count(row.get("ground_truth"))
+        if k in by_k:
+            by_k[k].append(row)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    written = 0
+    with open(out_path, "w") as f:
+        for k in buckets:
+            rows = by_k[k]
+            rng.shuffle(rows)
+            for i, row in enumerate(rows[:n_per_bucket]):
+                prompt = row.get("prompt") or ""
+                # strip a leading "user:" the Dolci prompts carry
+                prompt = prompt[5:].lstrip() if prompt.lower().startswith("user:") else prompt
+                f.write(json.dumps({"prompt_id": f"if_k{k}_{i}", "prompt": prompt,
+                                    "k": k, "domain": "if"}) + "\n")
+                written += 1
+    return {"path": str(out_path), "n": written, "buckets": list(buckets)}
+
+
 def k_histogram(name: str, split: str = "train") -> dict[int, int]:
     """Count rows per k (for dry-run reporting / sanity)."""
     ds = load_dolci_if(name, split)

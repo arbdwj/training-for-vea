@@ -1,0 +1,65 @@
+# End-to-end SMOKE: ~100 training steps on 7B, small eval, LOCAL Nemotron judge (no API key).
+# Proves the whole train -> eval -> judge chain works before scaling to 32B.
+# Run on the GH200 node (or Modal x86):  python scripts/run.py run configs/smoke_7b_e2e.yaml --backend local
+name: smoke_7b_e2e
+backend: local
+output_dir: runs/smoke_7b_e2e
+
+model:                               # STAGE 1 — short OlmoRL run on 7B, single k=3 rung
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-7B-Think-DPO
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: 3}                   # single rung (no sweep) for the smoke
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 2.0e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 16
+    response_length: 4096            # smaller than 8k for a fast smoke
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 100                   # ~100 steps -> total_episodes auto-derived
+    save_steps: 100
+  cluster:
+    deepspeed_stage: 2               # 7B fits ZeRO-2 (no heavy offload needed)
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1
+    gradient_checkpointing: true
+    attn: sdpa                       # aarch64: no flash-attn
+  backend: {type: local, gpus: 4}
+
+eval:                                # STAGE 2 — eval the trained ckpt across complexities
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 3, 5]}
+      n_per_bucket: 20
+  generation:
+    rollouts: 4
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 4096
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 4, tensor_parallel: 2}
+
+judge:                               # STAGE 3 — LOCAL open-weight judge, no API key
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/Llama-3.1-Nemotron-Nano-8B-v1   # swap up to Super-49B / 70B for real runs
+      provider: vllm
+      opts: {tensor_parallel: 1, max_model_len: 20000}
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]

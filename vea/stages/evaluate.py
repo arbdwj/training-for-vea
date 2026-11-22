@@ -92,3 +92,34 @@ def cell_filename(model_label: str, domain: str, bucket_val) -> str:
     safe = model_label.replace("=", "").replace(":", "_")
     kv = bucket_val if bucket_val is not None else 0
     return f"{safe}__{domain}_k{kv}.jsonl"
+
+
+def run_local(stage: EvalStage, model_path: str, model_label: str, prompts_path: str,
+              out_dir, store=None, tensor_parallel: int = 1):
+    """Generate every cell for one model on a local GPU (the node). Writes rollouts/*.jsonl."""
+    from pathlib import Path as _P
+    from vllm import LLM
+    out_dir = _P(out_dir)
+    (out_dir).mkdir(parents=True, exist_ok=True)
+    gen = stage.generation
+    llm = LLM(model=model_path, tensor_parallel_size=tensor_parallel,
+              max_model_len=gen.max_tokens + 2048, trust_remote_code=True)
+    all_prompts = load_prompts(prompts_path)
+    for ds in stage.datasets:
+        buckets = (ds.filter.get(ds.bucket_by) if ds.bucket_by and
+                   isinstance(ds.filter.get(ds.bucket_by), list) else [None])
+        if buckets == [None] and ds.bucket_by == "k":
+            buckets = [1, 2, 3, 4, 5]
+        for b in buckets:
+            n = ds.n_per_bucket if b is not None else (ds.n or 100)
+            sel = select_bucket(all_prompts, ds.bucket_by, b, n)
+            fname = cell_filename(model_label, ds.name if ds.bucket_by != "k" else "if", b)
+            tid = f"gen:{model_label}:{ds.name}/{ds.bucket_by}{b}" if b is not None else f"gen:{model_label}:{ds.name}"
+            if store is not None:
+                store.update(tid, status="running", total=len(sel) * gen.rollouts)
+            cb = (lambda done, _tid=tid: store.update(_tid, done=done)) if store is not None else None
+            generate_cell(llm, sel, gen, out_dir / fname, model_label,
+                          ds.name if ds.bucket_by != "k" else "if", b, progress_cb=cb)
+            if store is not None:
+                store.update(tid, status="done")
+    return str(out_dir)

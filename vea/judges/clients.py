@@ -87,10 +87,18 @@ class JudgeRequest:
 
 
 class AnthropicBatchJudge:
+    needs_api_key = True
+
     def __init__(self, model: str):
         import anthropic
         self.model = model
         self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+    def judge_all(self, reqs: list[JudgeRequest], progress_cb=None):
+        """Unified entry: returns list[(custom_id, text, ok)]."""
+        bid = self.submit(reqs)
+        self.poll(bid, total=len(reqs), progress_cb=progress_cb)
+        return list(self.results(bid))
 
     def submit(self, reqs: list[JudgeRequest]) -> str:
         batch = self.client.messages.batches.create(requests=[
@@ -125,9 +133,72 @@ class AnthropicBatchJudge:
                 yield res.custom_id, "", False
 
 
-def make_judge(model: str):
-    """Pick a client by model id."""
-    if model.startswith(("gpt", "o1", "o3", "o4")):
+class VLLMJudge:
+    """Local, API-key-free judge via vLLM — e.g. a Nemotron model on the GH200 node.
+
+    Loads the model once, judges in batched chat calls. Same <score>/<quote> prompt
+    and parse as the API judges, so the pipeline is identical — only the judge model
+    (and therefore the absolute VEA rate) differs.
+    """
+    needs_api_key = False
+
+    def __init__(self, model: str, tensor_parallel: int = 1, max_model_len: int | None = None,
+                 max_tokens: int = 1024, gpu_memory_utilization: float = 0.90, **kw):
+        self.model = model
+        self.tp = int(tensor_parallel)
+        self.max_model_len = max_model_len
+        self.max_tokens = int(max_tokens)
+        self.gpu_mem = float(gpu_memory_utilization)
+        self._llm = None
+        self._extra = kw
+
+    def _load(self):
+        if self._llm is None:
+            from vllm import LLM
+            kw = dict(model=self.model, tensor_parallel_size=self.tp,
+                      gpu_memory_utilization=self.gpu_mem, trust_remote_code=True)
+            if self.max_model_len:
+                kw["max_model_len"] = self.max_model_len
+            self._llm = LLM(**kw)
+        return self._llm
+
+    def judge_all(self, reqs: list[JudgeRequest], progress_cb=None, chunk: int = 512):
+        from vllm import SamplingParams
+        llm = self._load()
+        sp = SamplingParams(temperature=0.0, max_tokens=self.max_tokens)
+        out = []
+        for i in range(0, len(reqs), chunk):
+            part = reqs[i:i + chunk]
+            convos = [[{"role": "system", "content": r.system},
+                       {"role": "user", "content": r.user}] if r.system else
+                      [{"role": "user", "content": r.user}] for r in part]
+            res = llm.chat(convos, sp, use_tqdm=False)
+            for r, o in zip(part, res):
+                text = o.outputs[0].text if o.outputs else ""
+                out.append((r.custom_id, text, True))
+            if progress_cb:
+                progress_cb(min(i + chunk, len(reqs)), len(reqs))
+        return out
+
+
+def make_judge(model: str, provider: str | None = None, **opts):
+    """Pick a judge client. Explicit `provider` wins; otherwise infer from the model id.
+
+    provider: anthropic | openai | vllm (local).  A bare HF id ("nvidia/...", "Qwen/...")
+    infers vllm, so an on-node open-weight judge needs no API key.
+    """
+    if provider is None:
+        if model.startswith(("claude", "anthropic")):
+            provider = "anthropic"
+        elif model.startswith(("gpt", "o1", "o3", "o4")):
+            provider = "openai"
+        else:
+            provider = "vllm"          # HF id -> local vLLM
+    if provider == "anthropic":
+        return AnthropicBatchJudge(model)
+    if provider == "openai":
         from .openai_client import OpenAIBatchJudge  # lazy; optional
         return OpenAIBatchJudge(model)
-    return AnthropicBatchJudge(model)
+    if provider == "vllm":
+        return VLLMJudge(model, **opts)
+    raise ValueError(f"unknown judge provider '{provider}'")

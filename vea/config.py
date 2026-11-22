@@ -225,6 +225,8 @@ class JudgeCfg:
     model: str | None = None
     prompt: str | None = None              # path prefix (loads .system.txt/.user.txt) or single file
     parse: str = "score_quote"
+    provider: str | None = None            # anthropic | openai | vllm (inferred if None)
+    opts: dict = field(default_factory=dict)   # vllm: tensor_parallel, max_model_len, ...
 
 
 @dataclass
@@ -255,6 +257,8 @@ class JudgeStage:
                 model=x.get("model"),
                 prompt=x.get("prompt"),
                 parse=x.get("parse", "score_quote"),
+                provider=x.get("provider"),
+                opts=dict(x.get("opts", {})),
             ))
         gb = d.get("group_by", ["model"])
         if isinstance(gb, str):

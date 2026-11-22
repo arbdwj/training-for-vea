@@ -82,11 +82,34 @@ def run(cfg: PipelineCfg, store: ProgressStore | None = None,
         elif be_type == "modal":
             print(f"[train:{label}] modal backend: deploy vea/backends/modal_app.py and invoke "
                   f"with argv; see README. Command:\n  {oi.command_string(argv)}")
-        else:  # local
-            print(f"[train:{label}] local run command (needs a GPU + open-instruct env):\n"
-                  f"  cd {Path('third_party/open-instruct').resolve()} && {oi.command_string(argv)}")
+        else:  # local — actually run grpo_fast.py on this node (foreground, tailed)
+            if store is not None:
+                _run_local_train(argv, tid, store, _steps(ms))
         refs.append(ModelRef("checkpoint", out_dir, label))
     return refs
+
+
+def _run_local_train(argv, tid, store, total):
+    """Run grpo_fast.py in the vendored open-instruct, streaming progress into the store."""
+    import subprocess
+
+    from ..backends.base import parse_train_log_line
+    oi_dir = Path("third_party/open-instruct").resolve()
+    store.update(tid, status="running", total=total, note="grpo_fast.py (local)")
+    print(f"[train] launching: cd {oi_dir} && {oi.command_string(argv)}")
+    proc = subprocess.Popen(argv, cwd=str(oi_dir), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in proc.stdout:
+        print(line, end="")
+        step, reward = parse_train_log_line(line)
+        if step is not None:
+            store.update(tid, done=step)
+        if reward is not None:
+            store.update(tid, metric=reward)
+    proc.wait()
+    store.update(tid, status="done" if proc.returncode == 0 else "error")
+    if proc.returncode != 0:
+        raise SystemExit(f"[train] grpo_fast.py exited {proc.returncode}")
 
 
 def _steps(ms) -> int:

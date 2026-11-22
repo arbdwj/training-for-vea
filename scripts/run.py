@@ -104,32 +104,72 @@ def cmd_execute(cfg, tasks, stages, backend_override, limit=None):
     for t in tasks:
         store.add(t.id, t.stage, total=t.total, backend=t.backend, metric_name=t.metric_name)
 
-    if "model" in stages and cfg.model:
+    from pathlib import Path as _P
+    refs = []
+
+    # resolve model refs (train if selected; else cheaply resolve a pretrained/closed ref)
+    if cfg.model:
         from vea.stages import model as modelstage
-        print(f"\n### STAGE model ({cfg.model.source}) ###")
-        refs = modelstage.run(cfg, store, backend_override)
-        print(f"[model] produced {len(refs)} model ref(s): " +
-              ", ".join(f"{r.label}->{r.kind}:{r.ref}" for r in refs))
+        if "model" in stages:
+            print(f"\n### STAGE model ({cfg.model.source}) ###")
+            refs = modelstage.run(cfg, store, backend_override)
+        elif cfg.model.source in ("pretrained", "closed"):
+            refs = modelstage.run(cfg, store, backend_override, prepare_data=False)
+        if refs:
+            print(f"[model] model ref(s): " + ", ".join(f"{r.label}->{r.kind}:{r.ref}" for r in refs))
 
     if "eval" in stages and cfg.eval:
-        from vea.stages import evaluate as evalstage
         from vea import plan as planmod
+        from vea.stages import evaluate as evalstage
         print("\n### STAGE eval ###")
-        cells = evalstage.plan_cells(cfg.eval, planmod.model_labels(cfg))
         be = backend_override or cfg.eval.backend.type
-        print(f"[eval] {len(cells)} generation cell(s) on backend '{be}':")
-        for lbl, ds, b, n in cells:
-            print(f"   {evalstage.cell_filename(lbl, ds.name, b)}  ({n}×{cfg.eval.generation.rollouts} rollouts)")
-        if be == "modal":
-            print("[eval] launch: `modal deploy vea/backends/modal_app.py` then invoke generate(); "
-                  "the UI polls the vea-progress Dict.")
+        labels = [r.label for r in refs] or planmod.model_labels(cfg)
+        cells = evalstage.plan_cells(cfg.eval, labels)
+        print(f"[eval] {len(cells)} generation cell(s) on backend '{be}'")
+        if be == "local":
+            rollouts_dir = _P(cfg.output_dir) / "rollouts"
+            prompts_path = _resolve_eval_prompts(cfg, _P(cfg.output_dir))
+            model_map = {r.label: r.ref for r in refs} or {labels[0]: (cfg.model.model if cfg.model else labels[0])}
+            tp = cfg.eval.backend.extra.get("tensor_parallel", cfg.eval.backend.gpus or 1)
+            for lbl, mref in model_map.items():
+                print(f"[eval] generating rollouts for {lbl} ({mref}) -> {rollouts_dir}")
+                evalstage.run_local(cfg.eval, mref, lbl, prompts_path, rollouts_dir, store, tp)
+        elif be == "modal":
+            print("[eval] launch via Modal: `modal deploy vea/backends/modal_app.py`, invoke generate(); "
+                  "UI polls the vea-progress Dict.")
         else:
-            print("[eval] generation runs on the GPU node via vea/stages/evaluate.py:generate_cell().")
+            print("[eval] slurm backend: run the eval on the node via evaluate.run_local (see README).")
 
     if "judge" in stages and cfg.judge:
         from vea.stages import judge as judgestage
         print("\n### STAGE judge ###")
+        # default rollouts_dir to this run's eval output if not set
+        if not cfg.judge.rollouts_dir and (_P(cfg.output_dir) / "rollouts").is_dir():
+            cfg.judge.rollouts_dir = str(_P(cfg.output_dir) / "rollouts")
+        if not cfg.judge.prompts:
+            cfg.judge.prompts = _resolve_eval_prompts(cfg, _P(cfg.output_dir), create=False)
         judgestage.run(cfg, backend_override, limit=limit)
+
+
+def _resolve_eval_prompts(cfg, out_dir, create=True):
+    """Return a local eval-prompt jsonl path, building it from hf:// Dolci if needed."""
+    from pathlib import Path as _P
+    if not cfg.eval:
+        return None
+    ds0 = cfg.eval.datasets[0]
+    if not ds0.path.startswith("hf://"):
+        return ds0.path
+    local = _P(out_dir) / "eval_prompts.jsonl"
+    if local.exists() or not create:
+        return str(local)
+    from vea.data import prepare
+    buckets = ds0.filter.get("k", [1, 2, 3, 4, 5]) if ds0.bucket_by == "k" else [1, 2, 3, 4, 5]
+    info = prepare.sample_eval_prompts(ds0.path[len("hf://"):], local,
+                                       buckets=tuple(buckets),
+                                       n_per_bucket=ds0.n_per_bucket or 100,
+                                       seed=cfg.eval.generation.seed)
+    print(f"[eval] built eval prompts: {info['path']} ({info['n']} prompts)")
+    return str(local)
 
 
 def main():

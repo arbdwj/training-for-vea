@@ -125,19 +125,18 @@ def run(cfg: PipelineCfg, backend_override=None, limit: int | None = None):
 
 def _run_llm_judge(j, rolls, prompt_map, repo_root, store, tid):
     prompt = clients.load_prompt(j.prompt, repo_root)
-    judge = clients.make_judge(j.model)
+    judge = clients.make_judge(j.model, provider=j.provider, **j.opts)
     reqs = [clients.JudgeRequest(
                 custom_id=r["cid"], system=prompt.system,
                 user=prompt.render_user(prompt_map.get(r["prompt_id"], ""), r["completion"]))
             for r in rolls]
     store.update(tid, status="running")
-    batch_id = judge.submit(reqs)
-    print(f"[judge:{j.name}] submitted batch {batch_id} ({len(reqs)} reqs, model {j.model})")
-    judge.poll(batch_id, total=len(reqs),
-               progress_cb=lambda done, total: store.update(tid, done=done))
+    prov = getattr(judge, "__class__").__name__
+    print(f"[judge:{j.name}] judging {len(reqs)} rollouts with {j.model} ({prov})")
+    results = judge.judge_all(reqs, progress_cb=lambda done, total: store.update(tid, done=done))
     byid = {r["cid"]: r for r in rolls}
     recs = []
-    for cid, text, ok in judge.results(batch_id):
+    for cid, text, ok in results:
         base = byid.get(cid, {})
         score, quote, purposes = clients.parse_score_quote(text) if ok else (0, None, [])
         recs.append({"model": base.get("model"), "domain": base.get("domain"),
