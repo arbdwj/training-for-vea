@@ -117,6 +117,13 @@ def render(ms: ModelStage, *, data_path: str, output_dir: str, exp_name: str,
     if c.get("gradient_checkpointing"):
         argv += ["--gradient_checkpointing"]
 
+    # vllm_enforce_eager: skip vLLM's torch.compile + CUDA-graph capture at engine init.
+    # On aarch64/GH200 the 32B compile+capture can exceed open-instruct's 1200s init timeout
+    # (TimeoutError: Initializing vLLM engines). Eager trades a little rollout throughput for a
+    # fast, reliable startup — the right call for short/plumbing runs.
+    if c.get("vllm_enforce_eager"):
+        argv += ["--vllm_enforce_eager"]
+
     # attn: flash-attn is unavailable on aarch64. open-instruct's choices are
     # {torch, flash_2, flash_3, flash_4, te}; "torch" IS PyTorch SDPA (the eager/non-flash
     # path we want on GH200). Translate HF-style aliases (sdpa/eager) to the accepted name.

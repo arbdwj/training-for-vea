@@ -44,6 +44,8 @@ model:                               # STAGE 1 — all 5 rungs, ~20 steps each, 
     vllm_tensor_parallel_size: 1
     gradient_checkpointing: true
     attn: sdpa                       # -> rendered as --attn_implementation torch
+    vllm_enforce_eager: true         # skip torch.compile + CUDA-graph capture (else 32B init
+                                     # exceeds open-instruct's 1200s vLLM-init timeout on aarch64)
   backend: {type: local, gpus: 2}
 
 eval:                                # STAGE 2 — all 5 ckpts x k=1..5, 32B at TP=2
