@@ -117,12 +117,13 @@ def render(ms: ModelStage, *, data_path: str, output_dir: str, exp_name: str,
     if c.get("gradient_checkpointing"):
         argv += ["--gradient_checkpointing"]
 
-    # attn: flash-attn is unavailable on aarch64; sdpa requested -> unconfirmed flag name
+    # attn: flash-attn is unavailable on aarch64. open-instruct's choices are
+    # {torch, flash_2, flash_3, flash_4, te}; "torch" IS PyTorch SDPA (the eager/non-flash
+    # path we want on GH200). Translate HF-style aliases (sdpa/eager) to the accepted name.
     if c.get("attn"):
-        argv += ["--attn_implementation", str(c["attn"])]
-        warnings.append(f"--attn_implementation {c['attn']}: verify grpo_fast.py accepts this "
-                        "flag on the vendored commit (needed for aarch64/GH200 where flash-attn "
-                        "is unavailable); remove or rename if it rejects it")
+        _ATTN_ALIAS = {"sdpa": "torch", "eager": "torch"}
+        attn = _ATTN_ALIAS.get(str(c["attn"]).lower(), str(c["attn"]))
+        argv += ["--attn_implementation", attn]
 
     # arbitrary passthrough for anything else the user puts under params.extra_flags / cluster.extra_flags
     for src in (p.get("extra_flags"), c.get("extra_flags")):
