@@ -89,7 +89,10 @@ ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 # ...and a bounded worker count: Ray prestarts ~1 worker/CPU; on a 64+ core node that can exceed
 # the per-user process limit (raylet EAGAIN crash). Cap Ray's CPUs (>= actors' need ~20).
 ulimit -u 65536 2>/dev/null || ulimit -u "$(ulimit -Hu)" 2>/dev/null || true
-export OPEN_INSTRUCT_RAY_NUM_CPUS="${OPEN_INSTRUCT_RAY_NUM_CPUS:-32}"
+# Must be >= the full topology's CPU request: ~10/learner + dataprep 2 + manager 1 + vLLM 1
+# (1 learner -> 14, 3 learners -> 34). 64 covers the 4-GPU/3-learner config and is fork-safe on a
+# compute node (ulimit -u ~487k). Raise if a run logs "full topology requires at least CPU=N".
+export OPEN_INSTRUCT_RAY_NUM_CPUS="${OPEN_INSTRUCT_RAY_NUM_CPUS:-64}"
 # Cap Ray's object store (default ~30% of RAM = ~200GB on a GH200 node) so it doesn't compete with
 # the CPU-offloaded optimizer's host buffers and trip the OOM killer. 30GB is plenty for rollouts.
 export OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY="${OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY:-30000000000}"
