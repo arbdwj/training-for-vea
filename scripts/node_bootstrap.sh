@@ -8,7 +8,17 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 OI="$REPO/third_party/open-instruct"
 echo "== repo: $REPO"
 echo "== arch: $(uname -m)   (expect aarch64 on GH200)"
-command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "!! no nvidia-smi"
+# SLURM: the login node has no GPUs. Installing deps is fine here; the GPU preflight
+# (torch.cuda, vLLM load) only passes inside an allocation. Grab one with e.g.:
+#   salloc --nodes=1 --gpus=4 --time=00:30:00     then re-run this script, or just
+#   run the preflight alone inside the allocation:  python scripts/preflight.py
+if nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null; then
+  HAVE_GPU=1
+else
+  echo "!! no GPUs visible here (SLURM login node?) — install will proceed; run the"
+  echo "   GPU preflight inside an allocation:  salloc --gpus=4 -t 00:30:00  then  python scripts/preflight.py"
+  HAVE_GPU=0
+fi
 
 # ---------------------------------------------------------------------------
 # 1. open-instruct env (uv preferred; it knows the aarch64 markers in uv.lock)
@@ -37,15 +47,23 @@ fi
 # 3. preflight
 # ---------------------------------------------------------------------------
 PY="$VENV/bin/python"; [ -x "$PY" ] || PY="python3"
-echo "== preflight ($PY) =="
-"$PY" "$REPO/scripts/preflight.py" || echo "!! preflight reported problems (see above)"
+if [ "${HAVE_GPU:-0}" = "1" ]; then
+  echo "== preflight ($PY) =="
+  "$PY" "$REPO/scripts/preflight.py" || echo "!! preflight reported problems (see above)"
+else
+  echo "== skipping GPU preflight (no GPUs on this node). Inside an allocation run:"
+  echo "   $PY scripts/preflight.py"
+fi
 
 cat <<EOF
 
-Next (run stages as SEPARATE processes so each frees its GPU before the next):
-  $PY scripts/run.py run configs/e2e_32b.yaml --stages model --backend local   # ~100-step train
-  $PY scripts/run.py run configs/e2e_32b.yaml --stages eval  --backend local   # eval the ckpt
-  $PY scripts/run.py run configs/e2e_32b.yaml --stages judge                    # Nemotron-120B judge
+Next — submit the whole pipeline to SLURM (one allocation, logs to logs/vea_e2e_<jobid>.log):
+  export HF_TOKEN=...
+  sbatch scripts/run_e2e.sbatch configs/breadth_32b_fast.yaml
 
-Set HF_TOKEN in the environment first (gated model downloads).
+Or interactively inside an allocation (salloc --nodes=1 --gpus=4 -t 04:00:00):
+  source third_party/open-instruct/.venv/bin/activate
+  python scripts/run.py run configs/breadth_32b_fast.yaml --stages model --backend local 2>&1 | tee logs/model.log
+  python scripts/run.py run configs/breadth_32b_fast.yaml --stages eval  --backend local 2>&1 | tee logs/eval.log
+  python scripts/run.py run configs/breadth_32b_fast.yaml --stages judge                   2>&1 | tee logs/judge.log
 EOF

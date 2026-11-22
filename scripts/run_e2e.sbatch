@@ -1,0 +1,39 @@
+#!/bin/bash
+# Run the full train -> eval -> judge pipeline inside ONE SLURM allocation (GPU node).
+# Submit from the repo root:
+#   export HF_TOKEN=...                                   # carried into the job (--export=ALL default)
+#   sbatch scripts/run_e2e.sbatch configs/breadth_32b_fast.yaml
+# All stdout+stderr goes to logs/vea_e2e_<jobid>.log (the #SBATCH --output below).
+#
+#SBATCH --job-name=vea-e2e
+#SBATCH --nodes=1
+#SBATCH --gpus=4
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=64
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/vea_e2e_%j.log
+## ---- set these for your cluster (uncomment / edit) ----
+## #SBATCH --partition=gpu
+## #SBATCH --account=YOUR_ACCOUNT
+## #SBATCH --mem=0            # all node memory (Grace LPDDR for ZeRO offload)
+
+set -uo pipefail
+CONFIG="${1:-configs/breadth_32b_fast.yaml}"
+cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+mkdir -p logs
+
+echo "=== node: $(hostname)  job: ${SLURM_JOB_ID:-none}  config: $CONFIG ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "!! no GPUs visible"
+
+# use the env node_bootstrap.sh built (so grpo_fast's subprocess uses the same python)
+source third_party/open-instruct/.venv/bin/activate || { echo "!! run node_bootstrap.sh first"; exit 1; }
+export HF_TOKEN="${HF_TOKEN:-}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+
+run() { echo "=== STAGE $1  ($(date '+%H:%M:%S')) ==="; python scripts/run.py run "$CONFIG" "${@:2}"; }
+
+run model --stages model --backend local || { echo "!! model stage failed"; exit 1; }
+run eval  --stages eval  --backend local || { echo "!! eval stage failed";  exit 1; }
+run judge --stages judge                  || { echo "!! judge stage failed"; exit 1; }
+
+echo "=== DONE  ($(date '+%H:%M:%S'))  summary -> runs/$(python -c "import yaml;print(yaml.safe_load(open('$CONFIG'))['output_dir'])" 2>/dev/null)/summary.json ==="
