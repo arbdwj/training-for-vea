@@ -44,8 +44,13 @@ module load "${CUDA_MODULE:-cudatoolkit/24.11_12.6}" 2>/dev/null \
 if [ -z "${CUDA_HOME:-}" ] && command -v nvcc >/dev/null; then
   export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
 fi
+# DeepSpeed JIT-compiles CPUAdam (optimizer offload) and hard-asserts the toolkit CUDA major.minor
+# equals torch's. The cluster's newest toolkit is 12.6 but torch is cu130 and there is no CUDA-13
+# module, so skip the check: CPUAdam's CUDA use is pinned-memory calls (stable 12.6->13.0) and its
+# device code runs forward-compatibly on the 13.0 driver.
+export DS_SKIP_CUDA_CHECK="${DS_SKIP_CUDA_CHECK:-1}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TMPDIR:-/tmp}/triton_$USER}"; mkdir -p "$TRITON_CACHE_DIR" 2>/dev/null || true
-echo "CUDA_HOME=${CUDA_HOME:-UNSET}  nvcc=$(command -v nvcc || echo none)"
+echo "CUDA_HOME=${CUDA_HOME:-UNSET}  nvcc=$(command -v nvcc || echo none)  DS_SKIP_CUDA_CHECK=$DS_SKIP_CUDA_CHECK"
 [ -z "${CUDA_HOME:-}" ] && echo "!! CUDA_HOME unset — DeepSpeed will fail. Set CUDA_MODULE=<module> (module avail cuda)."
 
 # Ray needs a high open-file limit (default 4000 here starves its sockets -> raylet/worker EOF).
