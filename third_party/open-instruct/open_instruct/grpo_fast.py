@@ -601,6 +601,11 @@ class PolicyTrainerRayProcess(RayProcess):
         # (Base is replicated under ZeRO<=2, so merge operates on full weights; name mapper strips the
         # PEFT wrapper and drops the now-merged adapter params.)
         is_peft = isinstance(self.model.module, PeftModel)
+        # vea-fork: with a 64GB base replicated on each learner (ZeRO<=2), cloning ALL params at once
+        # for the send (gather_whole_model=True) spikes +64GB and OOMs the 95GB GPU. Stream the LoRA
+        # sync param-by-param instead (peak +1 param); the base isn't sharded so no whole-model gather
+        # is needed anyway.
+        gather_whole_model = self.args.gather_whole_model and not is_peft
         if is_peft:
             self.model.module.merge_adapter()
             name_mapper = _peft_vllm_name_mapper(name_mapper)
@@ -610,7 +615,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 vllm_engines=self.vllm_engines,
                 model_update_group=self.model_update_group,
                 model_step=model_step,
-                gather_whole_model=self.args.gather_whole_model,
+                gather_whole_model=gather_whole_model,
                 name_mapper=name_mapper,
             )
         finally:

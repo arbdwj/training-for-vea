@@ -32,6 +32,10 @@ source third_party/open-instruct/.venv/bin/activate || { echo "!! run node_boots
 if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; else unset HF_TOKEN; fi
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTHONUNBUFFERED=1          # stream python prints to the log live (not block-buffered to file)
+# 64GB base replicated per learner leaves little headroom on a 95GB GPU; expandable segments lets the
+# allocator grow/shrink without fragmenting, so transient spikes (merge/unmerge for the LoRA vLLM sync)
+# don't OOM on a 50MB alloc with memory nominally free.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # vLLM v1 engine-core msgpack-serializes rollout outputs; Olmo-3 outputs carry a torch.dtype that
 # msgpack can't encode (TypeError: Object of type torch.dtype is not serializable). Allow the pickle
 # fallback — safe here: all engine traffic is localhost between our own trusted processes.
