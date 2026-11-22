@@ -30,6 +30,10 @@ source third_party/open-instruct/.venv/bin/activate || { echo "!! run node_boots
 export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTHONUNBUFFERED=1          # stream python prints to the log live (not block-buffered to file)
+# vLLM v1 engine-core msgpack-serializes rollout outputs; Olmo-3 outputs carry a torch.dtype that
+# msgpack can't encode (TypeError: Object of type torch.dtype is not serializable). Allow the pickle
+# fallback — safe here: all engine traffic is localhost between our own trusted processes.
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
 # --- CUDA toolkit for DeepSpeed (needs CUDA_HOME/nvcc at import) ------------
 # Set CUDA_MODULE=<your cluster's module> to pin it; else we try common names.

@@ -39,6 +39,9 @@ source third_party/open-instruct/.venv/bin/activate || { echo "!! no venv — in
 export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTHONUNBUFFERED=1
+# vLLM v1 engine-core msgpack-serializes rollout outputs; Olmo-3 outputs carry a torch.dtype that
+# msgpack can't encode. Allow the pickle fallback — safe here: engine traffic is localhost/trusted.
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
 # --- CUDA toolkit for DeepSpeed (needs CUDA_HOME/nvcc at import) ------------
 module load "${CUDA_MODULE:-cudatoolkit/24.11_12.6}" 2>/dev/null \
