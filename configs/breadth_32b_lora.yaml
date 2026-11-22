@@ -1,0 +1,81 @@
+# 32B LoRA-RL breadth test on a 4-GPU node: 3 learners + 1 vLLM engine.
+#
+# WHY LoRA fixes the memory wall that killed full-FT:
+#   full-FT needed a ~384GB fp32 optimizer for all 32B params -> CPU offload -> host OOM (twice).
+#   LoRA FREEZES the base and trains only small adapters (r=16), so the optimizer is tiny (MBs).
+#   -> NO CPU offload, NO CPUAdam, NO host-RAM pressure. This is LoRA-RL (cf. recent LoRA-RL results
+#      showing LoRA matches full-FT RL at a fraction of the memory), starting from the DPO checkpoint.
+#
+# Memory: ZeRO-3 shards the frozen 32B base across the 3 learners (~64GB bf16 / 3 = ~21GB/GPU) +
+# tiny adapter params/grads/optimizer + grad-checkpointed activations. vLLM engine holds the 32B
+# (bf16 ~64GB < 97GB) on the 4th GPU. Comfortable headroom, no offload.
+#
+# Submit (sbatch requests 4 GPUs + all node memory):
+#   sbatch scripts/run_e2e.sbatch configs/breadth_32b_lora.yaml
+name: breadth_32b_lora
+backend: local
+output_dir: runs/breadth_32b_lora
+
+model:                               # STAGE 1 — all 5 rungs, ~20 steps each, LoRA on 4 GPUs
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-32B-Think-DPO   # DPO = correct pre-RL checkpoint (base->SFT->DPO->RLVR)
+  finetune: lora                       # -> --use_peft --lora_r 16 --lora_alpha 32 --lora_dropout 0.05
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: [1, 2, 3, 4, 5]}       # the full breadth sweep -> 5 adapters
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 1.0e-5              # LoRA typically uses a higher LR than full-FT's 2e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 16
+    response_length: 2048
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 20
+    save_steps: 20
+  cluster:                             # 4-GPU: 3 learners (shard frozen base) + 1 vLLM engine
+    deepspeed_stage: 3                 # shard the frozen 32B base across the 3 learners
+    deepspeed_offload_param: false     # NOT needed with LoRA — base fits sharded on-GPU
+    deepspeed_offload_optimizer: false #  adapter optimizer is tiny -> keep on GPU (no CPUAdam)
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1
+    gradient_checkpointing: true
+    attn: sdpa
+    vllm_enforce_eager: true
+    lora: {r: 16, alpha: 32, dropout: 0.05}
+  backend: {type: local, gpus: 4}
+
+eval:                                  # STAGE 2 — all 5 adapters x k=1..5, 32B at TP=4
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 2, 3, 4, 5]}
+      n_per_bucket: 20
+  generation:
+    rollouts: 4
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 2048
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 4, tensor_parallel: 4}
+
+judge:                                 # STAGE 3 — Nemotron-120B auditor, FP8 at TP=4
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8
+      provider: vllm
+      opts: {tensor_parallel: 4, max_model_len: 12000}
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]

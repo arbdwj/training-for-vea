@@ -158,10 +158,28 @@ def render(ms: ModelStage, *, data_path: str, output_dir: str, exp_name: str,
                     argv += [flag, str(v)]
 
     if ms.finetune == "lora":
-        argv += ["--use_lora"]
-        warnings.append("finetune: lora -> added --use_lora (verify grpo_fast.py LoRA support/flags)")
+        # open-instruct's PEFT path: the flag is --use_peft (NOT --use_lora), plus LoRA hyperparams
+        # (model_utils.ModelConfig: use_peft/lora_r/lora_alpha/lora_dropout). Frozen base + small
+        # adapters -> no full-model optimizer, so no CPU offload needed. Override any of these via
+        # the config's extra_flags (e.g. extra_flags: {lora_r: 32, lora_target_modules: "..."}).
+        lora = c.get("lora", {}) if isinstance(c.get("lora"), dict) else {}
+        if not _has_flag(argv, "--use_peft"):
+            argv += ["--use_peft"]
+        if not _has_flag(argv, "--lora_r"):
+            argv += ["--lora_r", str(lora.get("r", 16))]
+        if not _has_flag(argv, "--lora_alpha"):
+            argv += ["--lora_alpha", str(lora.get("alpha", 32))]
+        if not _has_flag(argv, "--lora_dropout"):
+            argv += ["--lora_dropout", str(lora.get("dropout", 0.05))]
+        if lora.get("target_modules") and not _has_flag(argv, "--lora_target_modules"):
+            tm = lora["target_modules"]
+            argv += ["--lora_target_modules"] + (tm if isinstance(tm, list) else [str(tm)])
 
     return argv, warnings
+
+
+def _has_flag(argv: list[str], flag: str) -> bool:
+    return flag in argv
 
 
 def command_string(argv: list[str]) -> str:
