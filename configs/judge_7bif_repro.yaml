@@ -1,0 +1,18 @@
+# Local validation — re-judge the existing 7B-IF rollouts through the new pipeline.
+# Must reproduce: DPO-7B 4.8% / Think-7B 7.6% VEA (sonnet-4.5, temp-1.0/16k, 32B-matched).
+# Rollout files are {model}__if_k{N}.jsonl with records {prompt_id, completion, k}.
+name: judge_7bif_repro
+backend: local
+output_dir: runs/judge_7bif_repro
+
+judge:
+  rollouts_dir: /private/tmp/claude-501/-Users-rambharadwaj-eval-awareness-grader-awareness/7878c03b-718a-4c9a-83b0-acf9b94e2e7c/scratchpad/fig2a_7bif_rollouts/fig2a_7bif_rollouts
+  prompts: /Users/rambharadwaj/eval_awareness/grader_awareness/environment_vs_vea/datasets/fig2a_prompts/if.jsonl
+  judges:
+    - name: vea
+      kind: llm
+      model: claude-sonnet-4-5
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]

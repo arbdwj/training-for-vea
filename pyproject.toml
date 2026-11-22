@@ -1,0 +1,31 @@
+[project]
+name = "training-for-vea"
+version = "0.1.0"
+description = "Staged train -> eval -> judge pipeline for verbalized eval-awareness (VEA) experiments, wrapping vendored open-instruct (OlmoRL)."
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "anthropic>=0.40",
+    "openai>=1.40",
+]
+
+[project.optional-dependencies]
+# Heavy GPU stack for the eval/train stages — install only on Modal / the GH200 node.
+# open-instruct itself is vendored (third_party/open-instruct); install its deps from there.
+gpu = [
+    "datasets>=2.19",
+    "huggingface-hub>=0.24",
+    "vllm>=0.6",
+    "torch>=2.4",
+]
+modal = ["modal>=0.64"]
+
+[project.scripts]
+vea = "scripts.run:main"
+
+[tool.setuptools.packages.find]
+include = ["vea*"]
+
+[tool.ruff]
+line-length = 110

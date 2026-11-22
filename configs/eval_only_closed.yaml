@@ -1,0 +1,24 @@
+# Skip training — evaluate an already-trained / closed model and judge VEA.
+name: eval_only_closed
+backend: local
+output_dir: runs/eval_only_closed
+
+model:
+  source: pretrained                 # or: closed (API model, e.g. claude-sonnet-4-5)
+  model: allenai/Olmo-3-32B-Think
+
+eval:
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 2, 3, 4, 5]}
+      n_per_bucket: 100
+  generation: {rollouts: 8, temperature: 1.0, top_p: 1.0, max_tokens: 8192, seed: 42, template: olmo_think}
+  backend: {type: modal, gpu: "H200:2"}
+
+judge:
+  judges:
+    - {name: vea, kind: llm, model: claude-sonnet-4-5, prompt: prompts/vea_judge_scored, parse: score_quote}
+  aggregate: per_rollout
+  group_by: [model, k]

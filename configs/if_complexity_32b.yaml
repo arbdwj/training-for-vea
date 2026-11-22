@@ -1,0 +1,67 @@
+# Worked example — the k=1..5 instruction-complexity sweep on Olmo-3-32B.
+# Trains 5 checkpoints (k=1 constraint ... k=5 constraints) with the OlmoRL recipe
+# at an 8k generation budget, then measures VEA on k=1..5 buckets and judges with sonnet.
+name: if_complexity_32b
+backend: slurm                       # default backend; stages override below
+output_dir: runs/if_complexity_32b
+
+model:                               # STAGE 1 — train one checkpoint per k
+  source: train
+  framework: open_instruct           # vendored open-instruct grpo_fast.py (exact OlmoRL)
+  recipe_ref: third_party/open-instruct/scripts/train/olmo3/32b_think_rl.sh
+  base: allenai/Olmo-3-32B-Think-DPO
+  finetune: full_ft
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: [1, 2, 3, 4, 5]}     # list -> sweep: 5 training rungs
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:                            # -> grpo_fast.py flags
+    learning_rate: 2.0e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 32
+    response_length: 8192            # 8k budget
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0                        # no KL
+    loss_fn: dapo
+    max_steps: 300
+    save_steps: 50
+  cluster:                           # 4xGH200 scale-down
+    deepspeed_stage: 3
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1
+    gradient_checkpointing: true
+    attn: sdpa                       # flash-attn unavailable on aarch64
+  backend: {type: slurm, nodes: 1, gpus: 4, sec_per_step: 90}
+
+eval:                                # STAGE 2 — rollouts on k=1..5 buckets
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 2, 3, 4, 5]}
+      n_per_bucket: 100
+  generation:
+    rollouts: 8
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 8192
+    seed: 42
+    template: olmo_think
+  backend: {type: modal, gpu: "H200:4", sec_per_rollout: 6}
+
+judge:                               # STAGE 3 — VEA + per-constraint satisfaction
+  judges:
+    - name: vea
+      kind: llm
+      model: claude-sonnet-4-5
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+    - name: ifeval_sat
+      kind: verifier
+  aggregate: per_rollout
+  group_by: [model, k]
