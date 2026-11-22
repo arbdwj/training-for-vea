@@ -130,7 +130,8 @@ def render(ms: ModelStage, *, data_path: str, output_dir: str, exp_name: str,
     if c.get("deepspeed_offload_param"):
         argv += ["--deepspeed_offload_param"]
     if c.get("deepspeed_offload_optimizer"):
-        argv += ["--deepspeed_offload_optimizer"]
+        # offloading the optimizer requires DeepSpeed's CPU Adam (grpo_utils __post_init__ enforces it)
+        argv += ["--deepspeed_offload_optimizer", "--use_cpu_adam"]
 
     # attn: flash-attn is unavailable on aarch64. open-instruct's choices are
     # {torch, flash_2, flash_3, flash_4, te}; "torch" IS PyTorch SDPA (the eager/non-flash
