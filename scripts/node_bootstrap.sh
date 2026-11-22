@@ -24,10 +24,19 @@ fi
 # 1. open-instruct env (uv preferred; it knows the aarch64 markers in uv.lock)
 # ---------------------------------------------------------------------------
 cd "$OI"
+# open-instruct declares cuda12 (default) and cuda13 as CONFLICTING groups, so selecting
+# cuda13 requires dropping cuda12. GH200/aarch64 torch uses the cu130 index -> cuda13 default.
+# Override with CUDA_GROUP=cuda12 for a CUDA-12 node. Check your driver: nvidia-smi (top-right).
+CUDA_GROUP="${CUDA_GROUP:-cuda13}"
 if command -v uv >/dev/null; then
-  echo "== uv sync (open-instruct; flash-attn auto-skipped on aarch64) ..."
-  # cuda13 group targets the GH200 cu130 torch index per open-instruct pyproject
-  uv sync --group cuda13 || uv sync || { echo "!! uv sync failed — see output above"; }
+  echo "== uv sync (open-instruct, group=$CUDA_GROUP; flash-attn auto-skipped on aarch64) ..."
+  if [ "$CUDA_GROUP" = "cuda13" ]; then
+    uv sync --no-group cuda12 --group cuda13 \
+      || { echo "!! cuda13 sync failed; falling back to default (cuda12)"; uv sync; } \
+      || echo "!! uv sync failed — see output above"
+  else
+    uv sync || echo "!! uv sync failed — see output above"   # default cuda12
+  fi
   VENV="$OI/.venv"
 else
   echo "!! uv not found. Install it (https://docs.astral.sh/uv) or create a venv manually:"
