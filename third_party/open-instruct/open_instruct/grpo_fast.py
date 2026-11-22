@@ -2060,7 +2060,15 @@ def _discover_tools_from_datasets(dataset_mixer_list: list[str], dataset_mixer_l
     for i in range(0, len(dataset_mixer_list), 2):
         dataset_name = dataset_mixer_list[i]
         split = splits[i // 2]
-        ds = datasets.load_dataset(dataset_name, split=split)
+        # vea-fork: dataset_mixer_list entries may be local .jsonl/.parquet files (the main loader
+        # in dataset_transformation.py handles these); datasets.load_dataset(<bare path>) cannot, so
+        # route local files through the json/parquet builders to match. No tool cols -> no tools.
+        if os.path.exists(dataset_name) and dataset_name.endswith(".jsonl"):
+            ds = datasets.load_dataset("json", data_files=dataset_name, split=split)
+        elif os.path.exists(dataset_name) and dataset_name.endswith(".parquet"):
+            ds = datasets.load_dataset("parquet", data_files=dataset_name, split=split)
+        else:
+            ds = datasets.load_dataset(dataset_name, split=split)
         if TOOLS_COLUMN_KEY in ds.column_names:
             for tools in ds[TOOLS_COLUMN_KEY]:
                 if tools:
