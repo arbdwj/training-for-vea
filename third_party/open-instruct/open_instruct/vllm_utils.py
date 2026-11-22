@@ -496,13 +496,27 @@ def accumulate_completions(actor: "LLMRayActor", sub_request: dict) -> futures.F
 
     actor.request_outputs[base_request_id]["outputs"].append(sub_request["request_output"])
 
-    if len(actor.request_outputs[base_request_id]["outputs"]) == expected_n:
+    n_now = len(actor.request_outputs[base_request_id]["outputs"])
+    logger.info(f"[VEA accumulate] base={base_request_id}: {n_now}/{expected_n} outputs gathered")
+    if n_now == expected_n:
+        logger.info(f"[VEA accumulate] base={base_request_id}: COMPLETE -> scheduling finalize")
         return asyncio.run_coroutine_threadsafe(finalize_completed_request(actor, base_request_id), actor.loop)
 
     return None
 
 
 async def finalize_completed_request(actor: "LLMRayActor", base_request_id: str) -> None:
+    try:
+        await _finalize_completed_request_impl(actor, base_request_id)
+    except Exception as e:
+        logger.error(
+            f"[VEA finalize] base={base_request_id}: FAILED: {type(e).__name__}: {e}", exc_info=True
+        )
+        raise
+
+
+async def _finalize_completed_request_impl(actor: "LLMRayActor", base_request_id: str) -> None:
+    logger.info(f"[VEA finalize] base={base_request_id}: START")
     outputs = actor.request_outputs[base_request_id]["outputs"]
     ordered_outs = sorted(outputs, key=lambda x: split_request_id(x.request_id)["request_index"])
 
@@ -525,9 +539,12 @@ async def finalize_completed_request(actor: "LLMRayActor", base_request_id: str)
     actor.request_outputs.pop(base_request_id)
     actor.request_metadata.pop(base_request_id, None)
 
+    logger.info(f"[VEA finalize] base={base_request_id}: computing rewards (awaiting verifier...)")
     result.reward_scores, result.reward_metrics = await compute_rewards(actor, result, example)
     results_queue = actor.eval_results_queue if is_eval else actor.results_queue
+    logger.info(f"[VEA finalize] base={base_request_id}: rewards done -> results_queue.put (is_eval={is_eval})")
     results_queue.put(result)
+    logger.info(f"[VEA finalize] base={base_request_id}: PUSHED to results_queue")
 
 
 async def compute_rewards(actor: "LLMRayActor", result: GenerationResult, example: dict) -> tuple[list[float], dict]:
