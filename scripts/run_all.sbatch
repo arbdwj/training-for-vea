@@ -38,6 +38,7 @@ fi
 source third_party/open-instruct/.venv/bin/activate || { echo "!! no venv — install failed"; exit 1; }
 export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
+export PYTHONUNBUFFERED=1
 
 # --- CUDA toolkit for DeepSpeed (needs CUDA_HOME/nvcc at import) ------------
 module load "${CUDA_MODULE:-cudatoolkit/24.11_12.6}" 2>/dev/null \

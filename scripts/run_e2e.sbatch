@@ -29,6 +29,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "!! no GP
 source third_party/open-instruct/.venv/bin/activate || { echo "!! run node_bootstrap.sh first"; exit 1; }
 export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
+export PYTHONUNBUFFERED=1          # stream python prints to the log live (not block-buffered to file)
 
 # --- CUDA toolkit for DeepSpeed (needs CUDA_HOME/nvcc at import) ------------
 # Set CUDA_MODULE=<your cluster's module> to pin it; else we try common names.
