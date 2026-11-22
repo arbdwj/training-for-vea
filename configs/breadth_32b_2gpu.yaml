@@ -39,6 +39,8 @@ model:                               # STAGE 1 — all 5 rungs, ~20 steps each, 
     save_steps: 20
   cluster:                           # 2-GPU split: 1 learner + 1 vLLM engine
     deepspeed_stage: 3               # ZeRO-3 + CPU offload (Grace holds 32B optimizer+params)
+    deepspeed_offload_param: true    # 1 learner can't fit 32B params on one 95GB GPU -> offload to
+    deepspeed_offload_optimizer: true #  Grace LPDDR (480GB, NVLink-C2C). Required for low-learner 32B.
     num_learners: 1
     vllm_num_engines: 1
     vllm_tensor_parallel_size: 1

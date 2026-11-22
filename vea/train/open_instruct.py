@@ -124,6 +124,14 @@ def render(ms: ModelStage, *, data_path: str, output_dir: str, exp_name: str,
     if c.get("vllm_enforce_eager"):
         argv += ["--vllm_enforce_eager"]
 
+    # ZeRO-3 CPU offload: with few learners a 32B + Adam states won't fit one 95GB GPU (OOM at
+    # param.partition()). Offloading params/optimizer to CPU (the GH200's 480GB Grace LPDDR, fast
+    # over NVLink-C2C) is the intended single-/low-learner path. Slower per step, but it fits.
+    if c.get("deepspeed_offload_param"):
+        argv += ["--deepspeed_offload_param"]
+    if c.get("deepspeed_offload_optimizer"):
+        argv += ["--deepspeed_offload_optimizer"]
+
     # attn: flash-attn is unavailable on aarch64. open-instruct's choices are
     # {torch, flash_2, flash_3, flash_4, te}; "torch" IS PyTorch SDPA (the eager/non-flash
     # path we want on GH200). Translate HF-style aliases (sdpa/eager) to the accepted name.
