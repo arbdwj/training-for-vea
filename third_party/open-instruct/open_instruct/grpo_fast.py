@@ -70,7 +70,7 @@ import torch.utils.data
 import wandb
 from datasets import Dataset
 from huggingface_hub import HfApi
-from peft import PeftModel, get_peft_model_state_dict
+from peft import LoraConfig, PeftModel, get_peft_model, get_peft_model_state_dict
 from ray.util import queue as ray_queue
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -171,6 +171,24 @@ def _build_vlm_name_mapper(model_name: str):
     if "qwen3.5" in model_name.lower():
         return lambda name: f"language_model.{name}"
     return None
+
+
+def _peft_vllm_name_mapper(base_mapper):
+    """vea-fork: when the policy is a PeftModel whose adapters have been MERGED into the base
+    (merge_adapter()), vLLM needs the merged base weights under the ORIGINAL model names. PEFT wraps
+    the model as `base_model.model.<orig>` and replaces each LoRA-targeted Linear with a module whose
+    original weight lives at `<...>.base_layer.weight`. So: strip the `base_model.model.` wrapper and
+    the `.base_layer` infix, and DROP the adapter params (lora_A/lora_B/...), which are already merged.
+    Returns None for a param to skip it."""
+    def mapper(name: str):
+        if any(tok in name for tok in ("lora_A", "lora_B", "lora_embedding", "lora_magnitude")):
+            return None
+        clean = name
+        if clean.startswith("base_model.model."):
+            clean = clean[len("base_model.model."):]
+        clean = clean.replace(".base_layer.", ".")
+        return base_mapper(clean) if base_mapper else clean
+    return mapper
 
 
 def _startup_debug_context(
@@ -369,6 +387,26 @@ class PolicyTrainerRayProcess(RayProcess):
         self.policy.config.use_cache = False
         disable_dropout_in_model(self.policy)
         self.policy.gradient_checkpointing_enable()
+        # vea-fork: grpo_fast's RL trainer has NO LoRA support — use_peft is only consulted when
+        # SAVING, so the optimizer otherwise covers the FULL model (its ZeRO-3 fp32 master + Adam
+        # states OOM a 32B). Apply PEFT here so RL trains small adapters over a FROZEN base; the
+        # optimizer then (via get_optimizer_grouped_parameters' requires_grad filter) holds only
+        # adapter params. target_modules default to Olmo-3's projection names.
+        if getattr(model_config, "use_peft", False):
+            _peft_cfg = LoraConfig(
+                task_type=model_config.lora_task_type,
+                inference_mode=False,
+                r=model_config.lora_r,
+                lora_alpha=model_config.lora_alpha,
+                lora_dropout=model_config.lora_dropout,
+                target_modules=model_config.lora_target_modules
+                or ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                modules_to_save=model_config.lora_modules_to_save,
+            )
+            self.policy = get_peft_model(self.policy, _peft_cfg)
+            # grad checkpointing is already enabled above; make grads flow to the adapters through it
+            self.policy.enable_input_require_grads()
+            self.policy.print_trainable_parameters()
         if args.set_weight_decay_on_bias_and_norm:
             optim_params = get_optimizer_grouped_parameters(self.policy, args.weight_decay)
         else:
@@ -557,14 +595,27 @@ class PolicyTrainerRayProcess(RayProcess):
         # Ensure CUDA device is set before broadcast operations.
         # DeepSpeed 0.17.3+ sets device_id in init_process_group which affects NCCL device binding.
         torch.cuda.set_device(self.local_rank)
-        return vllm_utils.broadcast_weights_to_vllm(
-            model=self.model.module,
-            vllm_engines=self.vllm_engines,
-            model_update_group=self.model_update_group,
-            model_step=model_step,
-            gather_whole_model=self.args.gather_whole_model,
-            name_mapper=_build_vlm_name_mapper(self._model_name_or_path),
-        )
+        name_mapper = _build_vlm_name_mapper(self._model_name_or_path)
+        # vea-fork: for a LoRA policy, merge the adapters into the base so vLLM receives the current
+        # effective weights under the original names, then unmerge to keep training on the adapters.
+        # (Base is replicated under ZeRO<=2, so merge operates on full weights; name mapper strips the
+        # PEFT wrapper and drops the now-merged adapter params.)
+        is_peft = isinstance(self.model.module, PeftModel)
+        if is_peft:
+            self.model.module.merge_adapter()
+            name_mapper = _peft_vllm_name_mapper(name_mapper)
+        try:
+            return vllm_utils.broadcast_weights_to_vllm(
+                model=self.model.module,
+                vllm_engines=self.vllm_engines,
+                model_update_group=self.model_update_group,
+                model_step=model_step,
+                gather_whole_model=self.args.gather_whole_model,
+                name_mapper=name_mapper,
+            )
+        finally:
+            if is_peft:
+                self.model.module.unmerge_adapter()
 
     def update_ref_policy(self):
         if not self.args.load_ref_policy:

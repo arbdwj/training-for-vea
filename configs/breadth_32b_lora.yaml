@@ -39,9 +39,12 @@ model:                               # STAGE 1 — all 5 rungs, ~20 steps each, 
     loss_fn: dapo
     max_steps: 20
     save_steps: 20
-  cluster:                             # 4-GPU: 3 learners (shard frozen base) + 1 vLLM engine
-    deepspeed_stage: 3                 # shard the frozen 32B base across the 3 learners
-    deepspeed_offload_param: false     # NOT needed with LoRA — base fits sharded on-GPU
+  cluster:                             # 4-GPU: 3 learners (replicated frozen base) + 1 vLLM engine
+    deepspeed_stage: 2                 # ZeRO-2: base REPLICATED per learner (64GB bf16 < 97GB), only
+                                       #  the tiny adapter grads/optimizer are sharded. Stage 2 (not 3)
+                                       #  so merge_adapter() for the vLLM weight-sync acts on FULL
+                                       #  (un-sharded) base weights — ZeRO-3 + per-step merge is fragile.
+    deepspeed_offload_param: false     # not needed — frozen base fits on-GPU
     deepspeed_offload_optimizer: false #  adapter optimizer is tiny -> keep on GPU (no CPUAdam)
     num_learners: 3
     vllm_num_engines: 1

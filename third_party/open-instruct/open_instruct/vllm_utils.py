@@ -1329,8 +1329,17 @@ def _prepare_params_for_sync(
 
     DS3 gathered tensors may be non-contiguous or views into temporary buffers.
     Cloning ensures we send independent, contiguous tensors over NCCL.
+
+    A name_mapper that returns None drops the param (e.g. LoRA adapter params that have
+    already been merged into the base weights and must not be sent to vLLM).
     """
-    return [(name_mapper(n) if name_mapper else n, p.data.contiguous().clone()) for n, p in params]
+    out = []
+    for n, p in params:
+        mn = name_mapper(n) if name_mapper else n
+        if mn is None:
+            continue
+        out.append((mn, p.data.contiguous().clone()))
+    return out
 
 
 def _collect_weight_metadata(
@@ -1346,6 +1355,8 @@ def _collect_weight_metadata(
     shapes: list[list[int]] = []
     for name, param in model.named_parameters():
         mapped_name = name_mapper(name) if name_mapper else name
+        if mapped_name is None:  # mapper signals skip (e.g. merged-away LoRA adapter params)
+            continue
         names.append(mapped_name)
         dtype_names.append(str(param.dtype).split(".")[-1])
         shape = getattr(param, "ds_shape", param.shape)

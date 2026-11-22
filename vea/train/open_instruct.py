@@ -174,6 +174,14 @@ def render(ms: ModelStage, *, data_path: str, output_dir: str, exp_name: str,
         if lora.get("target_modules") and not _has_flag(argv, "--lora_target_modules"):
             tm = lora["target_modules"]
             argv += ["--lora_target_modules"] + (tm if isinstance(tm, list) else [str(tm)])
+        # grpo_fast's reference policy is a separate FULL-model copy and its update zips params with
+        # the policy -> incompatible with a PeftModel (and unneeded at beta=0, where there's no KL).
+        # Disable it for LoRA when beta==0 (grpo_utils requires beta==0 if load_ref_policy is off).
+        if float(p.get("beta", 0.0) or 0.0) == 0.0 and not _has_flag(argv, "--load_ref_policy"):
+            argv += ["--load_ref_policy", "false"]
+        else:
+            warnings.append("LoRA with beta>0 needs a reference policy; grpo_fast's ref path is not "
+                            "PEFT-compatible yet (ref should be the adapter-disabled base). Set beta: 0.0.")
 
     return argv, warnings
 
