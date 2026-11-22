@@ -36,7 +36,8 @@ if [ "${SKIP_INSTALL:-0}" != "1" ]; then
 fi
 
 source third_party/open-instruct/.venv/bin/activate || { echo "!! no venv — install failed"; exit 1; }
-export HF_TOKEN="${HF_TOKEN:-}"
+# Use HF_TOKEN if passed; else fall back to the stored ~/.cache/huggingface/token (hf auth login).
+if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; else unset HF_TOKEN; fi
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTHONUNBUFFERED=1
 # vLLM v1 engine-core msgpack-serializes rollout outputs; Olmo-3 outputs carry a torch.dtype that

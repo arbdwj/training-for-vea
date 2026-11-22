@@ -27,7 +27,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "!! no GP
 
 # use the env node_bootstrap.sh built (so grpo_fast's subprocess uses the same python)
 source third_party/open-instruct/.venv/bin/activate || { echo "!! run node_bootstrap.sh first"; exit 1; }
-export HF_TOKEN="${HF_TOKEN:-}"
+# Use HF_TOKEN if passed; else fall back to the stored ~/.cache/huggingface/token (hf auth login).
+# An empty HF_TOKEN env var shadows the stored token and breaks whoami(), so unset it when blank.
+if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; else unset HF_TOKEN; fi
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTHONUNBUFFERED=1          # stream python prints to the log live (not block-buffered to file)
 # vLLM v1 engine-core msgpack-serializes rollout outputs; Olmo-3 outputs carry a torch.dtype that
