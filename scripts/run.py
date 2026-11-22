@@ -107,14 +107,15 @@ def cmd_execute(cfg, tasks, stages, backend_override, limit=None):
     from pathlib import Path as _P
     refs = []
 
-    # resolve model refs (train if selected; else cheaply resolve a pretrained/closed ref)
+    # resolve model refs (train if selected; else resolve the ckpt/pretrained/closed paths
+    # so a separate eval/judge process still finds the trained checkpoints)
     if cfg.model:
         from vea.stages import model as modelstage
         if "model" in stages:
             print(f"\n### STAGE model ({cfg.model.source}) ###")
             refs = modelstage.run(cfg, store, backend_override)
-        elif cfg.model.source in ("pretrained", "closed"):
-            refs = modelstage.run(cfg, store, backend_override, prepare_data=False)
+        else:
+            refs = modelstage.run(cfg, store, backend_override, resolve_only=True)
         if refs:
             print(f"[model] model ref(s): " + ", ".join(f"{r.label}->{r.kind}:{r.ref}" for r in refs))
 

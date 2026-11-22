@@ -46,8 +46,9 @@ def plan_training(cfg: PipelineCfg):
     return jobs
 
 
-def run(cfg: PipelineCfg, store: ProgressStore | None = None,
-        backend_override: str | None = None, prepare_data: bool = True) -> list[ModelRef]:
+def resolve_refs(cfg: PipelineCfg) -> list[ModelRef]:
+    """Return the ModelRef(s) WITHOUT training — the checkpoint paths a train run would
+    produce (so a separate eval/judge process can find them), or the pretrained/closed id."""
     ms = cfg.model
     if ms is None:
         return []
@@ -55,6 +56,18 @@ def run(cfg: PipelineCfg, store: ProgressStore | None = None,
         return [ModelRef("hf", ms.model, "pretrained")]
     if ms.source == "closed":
         return [ModelRef("api", ms.model, "closed")]
+    return [ModelRef("checkpoint", out_dir, label)
+            for (label, _rung, _argv, _warns, _data, out_dir) in plan_training(cfg)]
+
+
+def run(cfg: PipelineCfg, store: ProgressStore | None = None,
+        backend_override: str | None = None, prepare_data: bool = True,
+        resolve_only: bool = False) -> list[ModelRef]:
+    ms = cfg.model
+    if ms is None:
+        return []
+    if resolve_only or ms.source in ("pretrained", "closed"):
+        return resolve_refs(cfg)
 
     # source == train
     from ..backends.slurm import SlurmBackend

@@ -1,0 +1,74 @@
+# FULL 32B experiment on the 4xGH200 node: the k=1..5 instruction-complexity sweep.
+# 5 checkpoints (trained on k=1 .. k=5 constraints), 300 OlmoRL steps each @ 8k,
+# then eval all 5 across k=1..5 buckets, then the Nemotron-120B VEA auditor.
+#
+# Run each stage as its own process (free GPU between 32B train / 32B eval / 120B judge):
+#   python scripts/run.py run configs/full_32b.yaml --stages model --backend local   # trains all 5 rungs (sequential)
+#   python scripts/run.py run configs/full_32b.yaml --stages eval  --backend local   # evals all 5 ckpts x k=1..5
+#   python scripts/run.py run configs/full_32b.yaml --stages judge                    # 120B judge over everything
+#
+# Big run: 5 x 300 steps of 32B, then 5 ckpts x 5 buckets x 100 x 8 = 20,000 rollouts judged.
+# Validate with configs/e2e_32b.yaml (100 steps, k=3 only) FIRST.
+name: full_32b
+backend: local
+output_dir: runs/full_32b
+
+model:                               # STAGE 1 — 5 checkpoints, one per k
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-32B-Think-DPO
+  finetune: full_ft
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: [1, 2, 3, 4, 5]}     # list -> sweep: 5 training rungs
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 2.0e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 32
+    response_length: 8192            # 8k budget (-> drop to 4096 if OOM on 4 GPUs)
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 300                   # full run length per rung
+    save_steps: 50
+  cluster:                           # 4xGH200 split: 3 learners + 1 vLLM engine
+    deepspeed_stage: 3               # ZeRO-3 + CPU offload (Grace holds optimizer+params)
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1     # if the engine OOMs, set 2 (then num_learners: 2)
+    gradient_checkpointing: true
+    attn: sdpa                       # aarch64: no flash-attn
+  backend: {type: local, gpus: 4}
+
+eval:                                # STAGE 2 — all 5 ckpts across k=1..5
+  datasets:
+    - name: dolci_if
+      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      bucket_by: k
+      filter: {k: [1, 2, 3, 4, 5]}
+      n_per_bucket: 100
+  generation:
+    rollouts: 8
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 8192
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 4, tensor_parallel: 2}
+
+judge:                               # STAGE 3 — Nemotron-3 Super 120B auditor, local (no API key)
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+      provider: vllm
+      opts: {tensor_parallel: 4, max_model_len: 24000}
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, k]
