@@ -53,6 +53,19 @@ fi
 # DeepSpeed CPUAdam JIT asserts toolkit CUDA == torch CUDA; 12.6 toolkit vs cu130 torch, no CUDA-13
 # module -> skip the check (CPUAdam's CUDA use is stable across 12.6->13.0, runs on the 13.0 driver).
 export DS_SKIP_CUDA_CHECK="${DS_SKIP_CUDA_CHECK:-1}"
+# CPUAdam JIT needs GCC>=9; default compute-node c++ is older. Load modern GNU compiler, set CXX/CC.
+module load "${GCC_MODULE:-gcc-native/12.3}" 2>/dev/null \
+  || module load gcc-native/13.2 2>/dev/null || module load gcc 2>/dev/null || true
+if [ -z "${CXX:-}" ]; then for g in g++-12 g++-13 g++ g++-14 g++-11 g++-10; do
+    p="$(command -v $g 2>/dev/null)" || continue
+    v="$("$p" -dumpversion 2>/dev/null | cut -d. -f1)"
+    if [ -n "$v" ] && [ "$v" -ge 9 ] 2>/dev/null; then export CXX="$p"; break; fi
+  done; fi
+if [ -z "${CC:-}" ]; then for c in gcc-12 gcc-13 gcc gcc-14 gcc-11 gcc-10; do
+    p="$(command -v $c 2>/dev/null)" || continue
+    v="$("$p" -dumpversion 2>/dev/null | cut -d. -f1)"
+    if [ -n "$v" ] && [ "$v" -ge 9 ] 2>/dev/null; then export CC="$p"; break; fi
+  done; fi
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TMPDIR:-/tmp}/triton_$USER}"; mkdir -p "$TRITON_CACHE_DIR" 2>/dev/null || true
 echo "CUDA_HOME=${CUDA_HOME:-UNSET}  nvcc=$(command -v nvcc || echo none)"
 [ -z "${CUDA_HOME:-}" ] && echo "!! CUDA_HOME unset — DeepSpeed will fail. Set CUDA_MODULE=<module> (module avail cuda)."
