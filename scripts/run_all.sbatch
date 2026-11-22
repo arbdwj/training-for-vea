@@ -40,8 +40,8 @@ export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
 # --- CUDA toolkit for DeepSpeed (needs CUDA_HOME/nvcc at import) ------------
-module load "${CUDA_MODULE:-cuda}" 2>/dev/null \
-  || module load cuda/13.0 2>/dev/null || module load cuda/12.4 2>/dev/null || true
+module load "${CUDA_MODULE:-cudatoolkit/24.11_12.6}" 2>/dev/null \
+  || module load cuda/12.6 2>/dev/null || module load cudatoolkit 2>/dev/null || true
 if [ -z "${CUDA_HOME:-}" ] && command -v nvcc >/dev/null; then
   export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
 fi
