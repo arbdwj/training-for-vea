@@ -1,0 +1,982 @@
+"""
+OLMo-core utility functions, shared training configurations, and model configuration mappings.
+"""
+
+import datetime
+import json
+import math
+import os
+import shlex
+import sys
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+import accelerate
+import safetensors
+import torch
+import torch.distributed as dist
+import transformers
+from olmo_core import optim as olmo_optim
+from olmo_core.data import TokenizerConfig as OLMoCoreTokenizerConfig
+from olmo_core.distributed.utils import get_rank, get_world_size, is_distributed
+from olmo_core.nn.attention import AttentionBackendName
+from olmo_core.nn.hf import convert as olmo_hf_convert
+from olmo_core.nn.hf.checkpoint import load_hf_model
+from olmo_core.nn.lm_head import LMLossImplementation
+from olmo_core.nn.moe import utils as oc_moe_utils
+from olmo_core.nn.rope import YaRNRoPEScalingConfig
+from olmo_core.nn.transformer import Transformer, TransformerConfig
+from olmo_core.optim.moe_optimizer import OLMoDDPOptimizerConfig, assign_full_tensor_to_dtensor
+from olmo_core.train import callbacks as train_callbacks
+from olmo_core.train import prepare_training_environment
+from olmo_core.train.callbacks import CheckpointerCallback
+from olmo_core.train.train_module.transformer import (
+    TransformerActivationCheckpointingConfig,
+    TransformerActivationCheckpointingMode,
+)
+from olmo_core.train.train_module.transformer.config import (
+    OLMoDDPTrainModuleConfig,
+    TransformerContextParallelConfig,
+    TransformerDataParallelConfig,
+    TransformerExpertParallelConfig,
+)
+
+from open_instruct import logger_utils, model_utils, olmo_core_callbacks, olmo_core_hybrid, utils
+from open_instruct.dataset_transformation import TokenizerConfig, get_cached_dataset_tulu
+
+logger = logger_utils.setup_logger(__name__)
+
+
+@dataclass
+class ExperimentConfig:
+    """Base configuration for experiment identity and metadata."""
+
+    exp_name: str = "experiment"
+    """The name of this experiment"""
+    run_name: str | None = None
+    """A unique name of this run"""
+    seed: int = 42
+    """Random seed for initialization and dataset shuffling."""
+    data_loader_seed: int | None = None
+    """Separate seed for data loader instance ordering. If None, uses seed."""
+
+
+@dataclass(kw_only=True)
+class ModelConfig:
+    """Configuration for model loading."""
+
+    model_name_or_path: str
+    """The model checkpoint for weights initialization."""
+    config_name: str | None = None
+    """Pretrained config name or path if not the same as model_name."""
+    attn_implementation: AttentionBackendName | None = None
+    """Which attention implementation to use. If None, auto-detects the best available."""
+    loss_implementation: LMLossImplementation = LMLossImplementation.default
+    """LM loss implementation (e.g. 'fused_linear' for Liger FLCE). Defaults to olmo-core's default.
+    Only consulted when labels are passed into the model (SFT); DPO computes loss from logits outside the lm_head."""
+    model_revision: str | None = None
+    """The specific model version to use (can be a branch name, tag name or commit id)."""
+    low_cpu_mem_usage: bool = False
+    """Create the model as an empty shell, then materialize parameters when pretrained weights are loaded."""
+    rope_scaling_factor: float | None = None
+    """YaRN RoPE scaling factor. When set, applies YaRN RoPE scaling to the model."""
+    rope_scaling_beta_fast: float = 32
+    """YaRN RoPE beta_fast parameter."""
+    rope_scaling_beta_slow: float = 1
+    """YaRN RoPE beta_slow parameter."""
+    rope_scaling_old_context_len: int = 8192
+    """YaRN RoPE old_context_len parameter."""
+
+    def __post_init__(self):
+        if self.attn_implementation is None:
+            self.attn_implementation = model_utils.detect_attn_implementation()
+
+
+@dataclass
+class TrainingConfig:
+    """Shared training hyperparameters used by SFT, DPO, and other OLMo-core trainers."""
+
+    num_epochs: int = 1
+    """Total number of training epochs to perform."""
+    per_device_train_batch_size: int = 8
+    """Batch size per GPU/TPU core/CPU for training."""
+    gradient_accumulation_steps: int = 1
+    """Number of updates steps to accumulate before performing a backward/update pass."""
+    learning_rate: float = 2e-5
+    """The initial learning rate for the optimizer."""
+    warmup_ratio: float = 0.1
+    """Linear warmup over warmup_ratio fraction of total steps."""
+    weight_decay: float = 0.0
+    """Weight decay for AdamW if we apply some."""
+    max_grad_norm: float | None = None
+    """Maximum gradient norm for clipping. None means no clipping."""
+    max_seq_length: int = 4096
+    """The maximum total input sequence length after tokenization."""
+    over_length_strategy: str = "keep"
+    """What to do with a conversation that `max_seq_length` truncation cut short: `keep` leaves it
+    unterminated, `terminate` ends it with a trainable EOS, `drop` discards it. The default leaves
+    existing dataset cache hashes untouched."""
+    lr_scheduler_type: str = "linear"
+    """The scheduler type to use for learning rate adjustment."""
+    max_train_steps: int | None = None
+    """If set, overrides the number of training steps. Otherwise, num_epochs is used."""
+    activation_memory_budget: float = 1.0
+    """Memory budget for activation checkpointing (0.0-1.0).
+
+    A practical "just turn it on" default is `0.5` (somewhat arbitrary, but works well in practice):
+    any value < 1.0 enables budget-mode checkpointing. Higher values use more memory and are
+    typically faster; lower values use less memory and are typically slower, so use the highest
+    value your hardware can support. See: https://pytorch.org/blog/activation-checkpointing-techniques/.
+    """
+    activation_checkpointing_mode: Literal["budget", "selected_modules"] = "budget"
+    """Activation checkpointing mode.
+
+    "budget" uses torch.compile's partitioner with `activation_memory_budget` (requires compilation,
+    and cannot checkpoint through opaque custom ops such as the GDN `fla` kernels). "selected_modules"
+    wraps the individual block submodules in `activation_checkpointing_modules` (by default all of
+    them, including the GDN mixer), which keeps compile *outside* the checkpoint boundary (the
+    supported order) while still recovering full-block memory savings, letting `torch.compile`
+    coexist with checkpointing at long sequences. olmo-core's "full" mode (wrapping whole blocks) is
+    intentionally unsupported: its recompute re-enters the compiled block's backward and fails an
+    inductor stride guard for GDN models.
+    """
+    activation_checkpointing_modules: list[str] = field(
+        default_factory=lambda: [
+            "blocks.*.attention_norm",
+            "blocks.*.attention",
+            "blocks.*.attention_residual_stream",
+            "blocks.*.feed_forward_norm",
+            "blocks.*.feed_forward",
+            "blocks.*.feed_forward_residual_stream",
+        ]
+    )
+    """Module-name globs to wrap when `activation_checkpointing_mode` is "selected_modules".
+
+    Defaults to every transformer-block submodule, including the GDN mixer (`blocks.*.attention`).
+    Wrapping submodules individually (rather than the whole block) keeps `torch.compile` *outside*
+    the checkpoint boundary, which is the order compile supports, while still recovering full-block
+    activation memory. The opaque `fla` kernel's recompute metadata check is suppressed by passing
+    `determinism_check="none"` through the activation checkpointing config.
+    """
+    compile_model: bool = True
+    """Whether to apply torch.compile to model blocks."""
+    fused_optimizer: bool = True
+    """Whether to use fused AdamW."""
+    cp_degree: int | None = None
+    """Context parallelism degree. When set, enables context parallelism."""
+    cp_strategy: Literal["llama3", "zig_zag", "ulysses"] = "llama3"
+    """Context parallelism strategy."""
+    expert_parallel_degree: int | None = None
+    """Expert parallelism degree for OLMoDDPModel (MoE v2) models: routed experts are split across this many
+    ranks. EP folds over the data-parallel ranks, so a group can span nodes. The degree must be above 1 and
+    divide the world size; a negative value means all ranks. The EP path (all-to-all kind, capacity) comes
+    from the model config's `block.ep`."""
+
+
+def build_ac_config(
+    activation_memory_budget: float, compile_model: bool, mode: str = "budget", modules: list[str] | None = None
+) -> TransformerActivationCheckpointingConfig | None:
+    if mode == "selected_modules":
+        return TransformerActivationCheckpointingConfig(
+            mode=TransformerActivationCheckpointingMode.selected_modules, modules=modules, determinism_check="none"
+        )
+    if activation_memory_budget < 1.0 and compile_model:
+        return TransformerActivationCheckpointingConfig(
+            mode=TransformerActivationCheckpointingMode.budget, activation_memory_budget=activation_memory_budget
+        )
+    return None
+
+
+def build_cp_config(training: TrainingConfig) -> TransformerContextParallelConfig | None:
+    if training.cp_degree is None:
+        return None
+    if training.cp_strategy == "llama3":
+        return TransformerContextParallelConfig.llama3(degree=training.cp_degree)
+    elif training.cp_strategy == "zig_zag":
+        return TransformerContextParallelConfig.zig_zag(degree=training.cp_degree)
+    elif training.cp_strategy == "ulysses":
+        return TransformerContextParallelConfig.ulysses(degree=training.cp_degree)
+    else:
+        raise ValueError(f"Unknown cp_strategy: {training.cp_strategy}")
+
+
+@dataclass
+class DatasetConfig:
+    """Configuration for dataset loading and processing."""
+
+    mixer_list: list[str] = field(default_factory=list)
+    """A list of datasets (local or HF) to sample from."""
+    mixer_list_splits: list[str] = field(default_factory=lambda: ["train"])
+    """The dataset splits to use for training"""
+    transform_fn: list[str] = field(default_factory=list)
+    """The list of transform functions to apply to the dataset."""
+    target_columns: list[str] = field(default_factory=list)
+    """The columns to use for the dataset."""
+    cache_mode: Literal["hf", "local"] = "local"
+    """The mode to use for caching the dataset."""
+    local_cache_dir: str = "local_dataset_cache"
+    """The directory to save the local dataset cache to."""
+    skip_cache: bool = False
+    """Whether to skip the cache."""
+    cache_dataset_only: bool = False
+    """Immediately exit after caching the dataset"""
+    config_hash: str | None = None
+    """The hash of the dataset configuration."""
+    hf_entity: str | None = None
+    """The user or org name for dataset caching on the Hugging Face Hub."""
+
+
+@dataclass
+class LoggingConfig:
+    """Configuration for logging and experiment tracking."""
+
+    logging_steps: int = 1
+    """Log the training loss and learning rate every logging_steps steps."""
+    with_tracking: bool = False
+    """If toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project: str = "open_instruct_internal"
+    """The wandb project name"""
+    wandb_entity: str | None = None
+    """The entity (team) of wandb's project"""
+    report_to: str | list[str] = "all"
+    """The integration(s) to report results and logs to."""
+    wandb_group_name: str | None = None
+    """Optional W&B group name used to group related runs together."""
+
+
+@dataclass
+class CheckpointConfig:
+    """Configuration for checkpointing."""
+
+    output_dir: str = "output/"
+    """The output directory where the model predictions and checkpoints will be written."""
+    checkpointing_steps: int = 500
+    """Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch."""
+    ephemeral_save_interval: int | None = None
+    """Temporary checkpoint cadence for OLMo-core trainers. Must be lower than checkpointing_steps when set."""
+    keep_last_n_checkpoints: int = 3
+    """How many checkpoints to keep in the output directory. -1 for all."""
+    resume_from_checkpoint: str | None = None
+    """Continue from a checkpoint in a *different* directory (resuming this run needs only ``output_dir``)."""
+
+
+def build_checkpointer_callback(
+    checkpointing_steps: int,
+    ephemeral_save_interval: int | None,
+    save_async: bool = True,
+    max_checkpoints: int | None = 3,
+) -> CheckpointerCallback:
+    """Construct a CheckpointerCallback with shared Open Instruct defaults.
+
+    ``max_checkpoints`` accepts the open-instruct convention where ``-1`` means
+    unlimited.  Negative values are mapped to ``None`` (keep all).
+
+    ``ephemeral_save_interval`` follows the same convention: a non-positive value
+    disables ephemeral checkpoints.
+    """
+    return CheckpointerCallback(
+        save_interval=checkpointing_steps,
+        ephemeral_save_interval=ephemeral_save_interval if (ephemeral_save_interval or 0) > 0 else None,
+        save_async=save_async,
+        max_checkpoints=max_checkpoints if max_checkpoints is not None and max_checkpoints >= 0 else None,
+    )
+
+
+def setup_distributed_env(seed: int, timeout: datetime.timedelta | None = None) -> tuple[int, int, bool]:
+    """Initialize the olmo-core training environment and return (global_rank, world_size, is_main_process)."""
+    kwargs: dict[str, Any] = {"seed": seed}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    prepare_training_environment(**kwargs)
+    global_rank = get_rank() if is_distributed() else 0
+    world_size = get_world_size() if is_distributed() else 1
+    is_main_process = global_rank == 0
+    logger_utils.setup_logger(rank=global_rank)
+    return global_rank, world_size, is_main_process
+
+
+def build_scheduler(lr_scheduler_type: str, warmup_ratio: float, num_training_steps: int):
+    """Build an olmo-core LR scheduler from a scheduler-type string."""
+    warmup_steps = int(num_training_steps * warmup_ratio)
+    if lr_scheduler_type == "cosine":
+        return olmo_optim.CosWithWarmup(warmup_steps=warmup_steps)
+    if lr_scheduler_type == "linear":
+        return olmo_optim.LinearWithWarmup(warmup_steps=warmup_steps, alpha_f=0.0)
+    if lr_scheduler_type == "constant":
+        return olmo_optim.ConstantWithWarmup(warmup_steps=warmup_steps)
+    raise ValueError(f"Unknown lr_scheduler_type: {lr_scheduler_type!r}")
+
+
+def load_hf_weights_into_olmo_core(
+    model_state_dict: dict[str, Any], model_name_or_path: str, work_dir: str | None = None
+) -> None:
+    """Load HF weights into an olmo-core state dict in place, dispatching on model type.
+
+    olmo-core's converter has no ``olmo_hybrid`` case, so the generic branch falls
+    through to the llama-style key templates. For hybrid that raises, since nothing
+    maps the GDN ``linear_attn.*`` keys, but the general failure is quiet:
+    ``load_hf_model`` writes back only the keys its converter produced, leaving
+    anything unmapped at whatever the model was initialized with.
+    """
+    hf_config = transformers.AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    if getattr(hf_config, "model_type", None) == olmo_core_hybrid.OLMO_HYBRID_MODEL_TYPE:
+        olmo_core_hybrid.load_hf_hybrid_model(model_name_or_path, model_state_dict)
+    else:
+        load_hf_model(model_name_or_path, model_state_dict, work_dir=work_dir)
+
+
+def load_hf_weights_into_model(model: torch.nn.Module, model_name_or_path: str, work_dir: str | None = None) -> None:
+    """Load an HF checkpoint into an olmo-core model through the model-type dispatcher."""
+    model_state_dict = model.state_dict()
+    load_hf_weights_into_olmo_core(model_state_dict, model_name_or_path, work_dir=work_dir)
+    model.load_state_dict(model_state_dict)
+
+
+def initialize_promoted_token_embeddings(train_module, tokenizer) -> int:
+    """Seed the rows of reserved-slot-promoted tokens on the olmo-core path.
+
+    Call this once the base weights are in place and before the first step -- and only when the
+    run is not resuming. `pre_train` looks like the natural hook but fires after a resume load
+    too, so a callback would re-seed on every restart and throw away what those rows learned.
+
+    By this point `parallelize_model` has sharded the embedding on the vocabulary dimension, so
+    the rows being read and the row being written generally live on different ranks;
+    `model_utils.seed_embedding_rows` handles that. A no-op when the tokenizer promoted nothing.
+    Returns the number of rows written per matrix.
+    """
+    rows = model_utils.promoted_token_rows(tokenizer)
+    if not rows:
+        return 0
+
+    model = train_module.model
+    matrices = [model.embeddings.weight]
+    # The olmo2/olmo3 presets leave tie_word_embeddings False, so the head is a second matrix
+    # that needs the same seed. The qwen3 presets tie it, where writing the one parameter twice
+    # would feed the row just written back in as one of its own sources.
+    if not model.tie_word_embeddings and model.lm_head is not None:
+        matrices.append(model.lm_head.w_out.weight)
+    for weight in matrices:
+        model_utils.seed_embedding_rows(weight, rows)
+    sync_optimizer_main_params(getattr(train_module, "optim", None), matrices)
+
+    logger.info(f"Seeded {len(rows)} promoted token row(s) across {len(matrices)} matrix/matrices: {rows}")
+    return len(rows)
+
+
+def sync_optimizer_main_params(optimizer, params: list[torch.Tensor]) -> None:
+    """Make an OLMoDDPOptimizer's main copies of `params` match the params after an in-place edit.
+
+    That optimizer (MoE v2 models) owns the weights: each `step()` writes its `<name>.main` states
+    back over the model. For bf16 params those are separate fp32 copies, filled when the base
+    checkpoint loaded, so an edit to the model alone is undone on step 1; for fp32 params they are
+    views of the params and the copy is a no-op. Other optimizers read the params themselves and
+    have no `states`, so this returns without doing anything.
+
+    Afterwards each synced main must equal its param exactly, or the run dies at startup.
+    """
+    states = getattr(optimizer, "states", None)
+    if states is None:
+        return
+    targets = {id(param) for param in params}
+    synced: list[tuple[str, torch.Tensor]] = []
+    for group in optimizer.param_groups:
+        for name, param in group["named_params"].items():
+            if id(param) in targets:
+                assign_full_tensor_to_dtensor(dst=states[f"{name}.main"], src=param.data.float().reshape(-1))
+                synced.append((name, param))
+    if len(synced) != len(targets):
+        raise RuntimeError(f"Found optimizer main params for {len(synced)} of {len(targets)} seeded matrices")
+    for name, param in synced:
+        main = states[f"{name}.main"].full_tensor().reshape(-1)
+        if not torch.equal(main, param.data.float().reshape(-1)):
+            raise RuntimeError(f"{name}: optimizer main param does not match the seeded param after the sync")
+    logger.info(f"Synced {len(synced)} optimizer main param(s) with the seeded rows")
+
+
+def reload_hf_checkpoint_after_parallelization(train_module, model_name_or_path: str, work_dir: str) -> None:
+    """Reload HF weights into a parallelized train_module.
+
+    TransformerTrainModule.__init__ calls parallelize_model which calls init_weights,
+    reinitializing all model weights. This reloads the HF checkpoint on top.
+    """
+    logger.info("Reloading HuggingFace weights after parallelization...")
+    load_hf_weights_into_model(train_module.model, model_name_or_path, work_dir=work_dir)
+
+
+def build_wandb_config(config_dict: dict) -> dict:
+    """Merge the Beaker runtime config into the wandb config so a run records the job that produced it.
+
+    `grpo_fast.py` and `dpo_tune_cache.py` already do this; without it an olmo-core run has no
+    reference to its Beaker experiment. Returns `config_dict` unchanged when not running on Beaker.
+
+    Only rank 0 performs the lookup: `maybe_get_beaker_config` shells out to the Beaker CLI once per
+    job result, and only rank 0 creates the wandb run.
+    """
+    if get_rank() != 0:
+        return config_dict
+    beaker_config = utils.maybe_get_beaker_config()
+    if beaker_config is None:
+        return config_dict
+    return {**config_dict, **vars(beaker_config)}
+
+
+def build_base_callbacks(
+    config_dict: dict,
+    run_name: str | None,
+    checkpointing_steps: int,
+    ephemeral_save_interval: int | None,
+    with_tracking: bool = False,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
+    save_async: bool = True,
+    max_checkpoints: int | None = 3,
+) -> dict[str, Any]:
+    """Build the callbacks shared across SFT and DPO: beaker, gpu monitor, checkpointer, and optional wandb."""
+    result: dict[str, Any] = {
+        "beaker": olmo_core_callbacks.BeakerCallbackV2(config=config_dict),
+        "gpu_monitor": train_callbacks.GPUMemoryMonitorCallback(),
+        "checkpointer": build_checkpointer_callback(
+            checkpointing_steps, ephemeral_save_interval, save_async=save_async, max_checkpoints=max_checkpoints
+        ),
+    }
+    if with_tracking and wandb_project:
+        result["wandb"] = train_callbacks.WandBCallback(
+            name=run_name,
+            entity=wandb_entity,
+            project=wandb_project,
+            config=build_wandb_config(config_dict),
+            enabled=True,
+            cancel_check_interval=10,
+        )
+    return result
+
+
+def is_hf_checkpoint(path: str) -> bool:
+    """Detect whether a model path is a HuggingFace checkpoint (vs olmo-core format).
+
+    Returns True for HF hub IDs (e.g. 'allenai/Olmo-3-1025-7B'), local/weka paths
+    holding an HF config.json, and paths with a '-hf' component. Returns False for
+    olmo-core distributed checkpoints, including remote URLs (e.g. gs://) without
+    an '-hf' marker.
+    """
+    if os.path.isdir(path):
+        config_path = os.path.join(path, "config.json")
+        if not os.path.isfile(config_path):
+            return False
+        # An olmo-core checkpoint directory also contains a config.json -- the full
+        # experiment config -- so its presence alone does not identify the format.
+        # HF configs always carry a top-level "model_type"; olmo-core's never does.
+        try:
+            with open(config_path) as config_file:
+                config = json.load(config_file)
+        except (OSError, ValueError):
+            return False
+        return isinstance(config, dict) and "model_type" in config
+    parts = path.replace("\\", "/").split("/")
+    if any("-hf" in part for part in parts):
+        return True
+    # A remote URL (gs://, s3://, ...) without an '-hf' marker is an olmo-core
+    # checkpoint: transformers cannot read from it, olmo-core's io layer can.
+    if "://" in path:
+        return False
+    return not os.path.isabs(path)
+
+
+OLMO_MODEL_CONFIG_MAP: dict[str, str] = {
+    "allenai/OLMo-2-0425-1B": "olmo2_1B_v2",
+    "allenai/OLMo-2-1124-7B": "olmo2_7B",
+    "allenai/OLMo-2-1124-13B": "olmo2_13B",
+    "allenai/OLMo-2-0325-32B": "olmo2_32B",
+    "allenai/Olmo-3-1025-7B": "olmo3_7B",
+    "allenai/Olmo-Hybrid-7B": "olmo3_hybrid_7B",
+    "allenai/Olmo-Hybrid-Instruct-SFT-7B": "olmo3_hybrid_7B",
+    "allenai/Olmo-Hybrid-Think-SFT-7B": "olmo3_hybrid_7B",
+    "allenai/OLMoE-1B-7B-0924": "olmoe_1B_7B",
+    "Qwen/Qwen3-0.6B": "qwen3_0_6B",
+    "Qwen/Qwen3-0.6B-Base": "qwen3_0_6B",
+    "Qwen/Qwen3-1.7B": "qwen3_1_7B",
+    "Qwen/Qwen3-4B": "qwen3_4B",
+    "Qwen/Qwen3-4B-Base": "qwen3_4B",
+    "Qwen/Qwen3-8B": "qwen3_8B",
+    "Qwen/Qwen3-14B": "qwen3_14B",
+    "Qwen/Qwen3-32B": "qwen3_32B",
+}
+
+
+def get_transformer_config(model_name_or_config: str, vocab_size: int, attn_backend: str) -> TransformerConfig:
+    """Get the appropriate TransformerConfig for a given model name or config name.
+
+    Args:
+        model_name_or_config: HuggingFace model name, path, or direct config name (e.g., 'olmo3_7B').
+        vocab_size: Vocabulary size for the model.
+        attn_backend: Attention backend name (e.g., 'flash_2', 'flash_3', 'torch').
+
+    Returns:
+        TransformerConfig for the specified model.
+
+    Raises:
+        ValueError: If model/config not found.
+    """
+    # Only olmo_core_finetune.py can train the MoE v2 (OLMoDDPModel) models such a file may describe.
+    if model_name_or_config.endswith(".json") and os.path.isfile(model_name_or_config):
+        return transformer_config_from_json(model_name_or_config, vocab_size)
+
+    config_name = OLMO_MODEL_CONFIG_MAP.get(model_name_or_config)
+    if config_name is None:
+        config_name = model_name_or_config
+
+    local_config = olmo_core_hybrid.LOCAL_TRANSFORMER_CONFIGS.get(config_name)
+    if local_config is not None:
+        return local_config(vocab_size=vocab_size, attn_backend=AttentionBackendName(attn_backend))
+
+    if not hasattr(TransformerConfig, config_name):
+        available_models = ", ".join(OLMO_MODEL_CONFIG_MAP.keys())
+        available_configs = [
+            name for name in dir(TransformerConfig) if name.startswith(("olmo", "qwen")) and not name.startswith("_")
+        ]
+        available_configs += olmo_core_hybrid.LOCAL_TRANSFORMER_CONFIGS
+        raise ValueError(
+            f"Model/config '{model_name_or_config}' not found. "
+            f"Available models: {available_models}. "
+            f"Available config names: {', '.join(available_configs)}"
+        )
+    return getattr(TransformerConfig, config_name)(
+        vocab_size=vocab_size, attn_backend=AttentionBackendName(attn_backend)
+    )
+
+
+def transformer_config_from_json(config_path: str, vocab_size: int) -> TransformerConfig:
+    """Build the architecture an olmo-core `config.json` records, rather than a preset.
+
+    Takes the file's `model` section (or the whole file, if it has none). This is how MoE v2
+    (`OLMoDDPModelConfig`) checkpoints load: they have no preset. Attention backends come from the
+    file, not `--attn_implementation`. The file's vocab size is kept so the weights still load.
+    """
+    with open(config_path) as config_file:
+        payload = json.load(config_file)
+    config = TransformerConfig.from_dict(payload.get("model", payload))
+    logger.info(
+        f"Built {type(config).__name__} from {config_path}: {config.num_params:,} params, "
+        f"{config.n_layers} layers, vocab {config.vocab_size}"
+    )
+    if vocab_size > config.vocab_size:
+        raise ValueError(
+            f"{config_path} has vocab_size {config.vocab_size}, below the tokenizer's padded vocab {vocab_size}: "
+            "token ids past the embedding would fail on the GPU. Is this the right tokenizer?"
+        )
+    if config.vocab_size != vocab_size:
+        logger.warning(
+            f"Config vocab_size {config.vocab_size} != tokenizer-derived {vocab_size}; "
+            "keeping the config's value so the weights still load."
+        )
+    return config
+
+
+def require_transformer_engine() -> None:
+    """Fail at startup when OLMo-core's MoE v2 token permutation has no kernels to call.
+
+    OLMo-core imports transformer-engine's permutation ops behind a guard and sets them to None
+    when it is missing, so without this check an MoE v2 model fails on its first forward pass.
+    """
+    if oc_moe_utils.moe_permute is None:
+        raise RuntimeError(
+            "MoE v2 (OLMoDDPModel) training needs transformer-engine: OLMo-core's MoE token permutation "
+            "calls transformer_engine.pytorch.permutation, which is not importable here. Only open-instruct's "
+            "MoE image installs it: launch with `scripts/train/build_image_and_launch.sh --cuda-version 13 "
+            "--moe SCRIPT`."
+        )
+
+
+def read_checkpoint_train_module(config_path: str) -> dict[str, Any]:
+    """The `train_module` section of an olmo-core `config.json`, which must hold `optim` and `dp_config`."""
+    with open(config_path) as config_file:
+        train_module = json.load(config_file).get("train_module")
+    missing = [key for key in ("optim", "dp_config") if key not in (train_module or {})]
+    if missing:
+        raise ValueError(f"{config_path} has no train_module {' or '.join(missing)} to build the MoE v2 trainer from.")
+    return train_module
+
+
+def build_ddp_train_module_config(
+    config_path: str,
+    rank_microbatch_size: int,
+    max_sequence_length: int,
+    learning_rate: float,
+    weight_decay: float,
+    scheduler: Any,
+    max_grad_norm: float | None,
+    compile_model: bool,
+    ac_config: TransformerActivationCheckpointingConfig | None,
+    expert_parallel_degree: int | None = None,
+) -> OLMoDDPTrainModuleConfig:
+    """Build the DDP train-module config for an OLMoDDPModel (MoE v2) model.
+
+    These models refuse FSDP and train through OLMo-core's DDP train module. The optimizer and
+    dp_config come from the checkpoint config's `train_module` section, the combination that
+    pretrained the model, with only the SFT knobs overridden: lr, weight decay, scheduler, batch
+    geometry, grad clipping and compilation, plus expert parallelism for models whose unsharded
+    experts and fp32 grads do not fit on one GPU (DDP shards neither). Per-group overrides are kept as
+    they are, and logged. The checkpoint's own ep_config is not carried over; a mismatch is logged.
+    The z-loss multiplier is the checkpoint's, as on the GPU SFT line whose runs this path reproduces
+    (the FSDP path turns z-loss off).
+    """
+    checkpoint_train_module = read_checkpoint_train_module(config_path)
+    optim_config = OLMoDDPOptimizerConfig.from_dict(checkpoint_train_module["optim"])
+    optim_config.lr = learning_rate
+    optim_config.weight_decay = weight_decay
+    # This optimizer always clips; an infinite threshold makes the clip coefficient 1, which is
+    # what `max_grad_norm=None` means on the FSDP path.
+    optim_config.max_grad_norm = max_grad_norm if max_grad_norm is not None else math.inf
+    for override in optim_config.group_overrides or []:
+        logger.info(f"Keeping the checkpoint's optimizer group override {override.params}: {override.opts}")
+    checkpoint_ep_degree = (checkpoint_train_module.get("ep_config") or {}).get("degree")
+    if checkpoint_ep_degree is not None and checkpoint_ep_degree != expert_parallel_degree:
+        this_run = (
+            f"degree {expert_parallel_degree}"
+            if expert_parallel_degree is not None
+            else "no expert parallelism; pass --expert_parallel_degree to shard the experts"
+        )
+        logger.warning(
+            f"The checkpoint was pretrained with expert parallelism degree {checkpoint_ep_degree} (negative means "
+            f"all ranks); this run uses {this_run}."
+        )
+
+    return OLMoDDPTrainModuleConfig(
+        rank_microbatch_size=rank_microbatch_size,
+        max_sequence_length=max_sequence_length,
+        optim=optim_config,
+        dp_config=TransformerDataParallelConfig.from_dict(checkpoint_train_module["dp_config"]),
+        ep_config=(
+            TransformerExpertParallelConfig(degree=expert_parallel_degree)
+            if expert_parallel_degree is not None
+            else None
+        ),
+        scheduler=scheduler,
+        compile_model=compile_model,
+        ac_config=ac_config,
+        z_loss_multiplier=checkpoint_train_module.get("z_loss_multiplier"),
+    )
+
+
+def use_doc_lens_for_emo_segments(model_config: TransformerConfig) -> int:
+    """Make every EMO router take its document segments from the batch's `doc_lens`.
+
+    EMO routing otherwise splits documents at EOS, which disagrees with metadata document
+    boundaries. Returns the number of EMO router configs changed; zero for models without EMO.
+    This setting persists in the saved model config. The supporting OLMo-core runtime must
+    require `doc_lens` in training and fall back to EOS during evaluation when it is absent.
+    """
+    # Hybrid models (olmo_core_hybrid) give `block` as a dict of named blocks.
+    block = model_config.block
+    blocks = list(block.values()) if isinstance(block, dict) else [block]
+    blocks += (getattr(model_config, "block_overrides", None) or {}).values()
+    changed = 0
+    for block in blocks:
+        router = getattr(block, "routed_experts_router", None)
+        emo = getattr(router, "emo", None)
+        if emo is None:
+            continue
+        if not hasattr(emo, "segment_ids_from"):
+            raise ValueError(
+                "This model routes with EMO, and the installed OLMo-core's EmoRouterConfig has no "
+                "segment_ids_from, so EMO would keep splitting documents at EOS."
+            )
+        emo.segment_ids_from = "doc_lens"
+        changed += 1
+    return changed
+
+
+def setup_model(
+    model_config_args: ModelConfig,
+    tc: TokenizerConfig | None = None,
+    init_device: str = "cpu",
+    emo_segments_from_doc_lens: bool = False,
+) -> tuple[Transformer, TransformerConfig]:
+    model_name_or_path = model_config_args.model_name_or_path
+    if is_hf_checkpoint(model_name_or_path):
+        logger.info(f"Detected HuggingFace checkpoint at {model_name_or_path}")
+        hf_config = transformers.AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+        vocab_size = hf_config.vocab_size
+    else:
+        logger.info(f"Detected olmo-core checkpoint at {model_name_or_path}")
+        assert model_config_args.config_name is not None, (
+            "--config_name is required when model_name_or_path is an olmo-core checkpoint"
+        )
+        assert tc is not None, "tc (TokenizerConfig) is required for olmo-core checkpoints to derive vocab_size"
+        vocab_size = to_oc_tokenizer_config(tc).padded_vocab_size()
+    logger.info(f"Building OLMo-core model with vocab_size={vocab_size}")
+    model_config = get_transformer_config(
+        model_config_args.config_name or model_name_or_path,
+        vocab_size,
+        attn_backend=model_config_args.attn_implementation,
+    )
+    model_config.lm_head.loss_implementation = LMLossImplementation(model_config_args.loss_implementation)
+    if model_config_args.rope_scaling_factor is not None:
+        model_config = model_config.with_rope_scaling(
+            YaRNRoPEScalingConfig(
+                factor=model_config_args.rope_scaling_factor,
+                beta_fast=model_config_args.rope_scaling_beta_fast,
+                beta_slow=model_config_args.rope_scaling_beta_slow,
+                old_context_len=model_config_args.rope_scaling_old_context_len,
+            )
+        )
+    if emo_segments_from_doc_lens and use_doc_lens_for_emo_segments(model_config):
+        logger.info("EMO routers take their document segments from doc_lens")
+    model = model_config.build(init_device=init_device)
+    return model, model_config
+
+
+def load_dataset_distributed(
+    args: DatasetConfig, tc: TokenizerConfig, transform_fn_args: list[dict], is_main_process: bool
+):
+    def _load():
+        return get_cached_dataset_tulu(
+            dataset_mixer_list=args.mixer_list,
+            dataset_mixer_list_splits=args.mixer_list_splits,
+            tc=tc,
+            dataset_transform_fn=args.transform_fn,
+            transform_fn_args=transform_fn_args,
+            target_columns=args.target_columns,
+            dataset_cache_mode=args.cache_mode,
+            dataset_config_hash=args.config_hash,
+            hf_entity=args.hf_entity,
+            dataset_local_cache_dir=args.local_cache_dir,
+            dataset_skip_cache=args.skip_cache,
+        )
+
+    # Rank 0 loads and caches the dataset to disk first. The barrier ensures
+    # the cache is fully written before other ranks call _load(), which then
+    # reads from the disk cache instead of all racing to download/process in
+    # parallel.
+    if is_main_process:
+        dataset = _load()
+    if is_distributed():
+        dist.barrier()
+    if not is_main_process:
+        dataset = _load()
+    return dataset
+
+
+def setup_tokenizer_and_cache(model_config: ModelConfig, dataset_config: DatasetConfig, tc: TokenizerConfig):
+    tc.tokenizer_name_or_path = (
+        model_config.model_name_or_path if tc.tokenizer_name_or_path is None else tc.tokenizer_name_or_path
+    )
+    tokenizer = tc.tokenizer
+    dataset_config.local_cache_dir = os.path.abspath(dataset_config.local_cache_dir)
+    if utils.is_beaker_job():
+        dataset_config.local_cache_dir = "/weka/oe-adapt-default/allennlp/deletable_open_instruct_dataset_cache"
+    return tokenizer
+
+
+def to_oc_tokenizer_config(tc: TokenizerConfig) -> OLMoCoreTokenizerConfig:
+    """Map open-instruct TokenizerConfig to olmo-core's TokenizerConfig for NumpyFSL loading.
+
+    Prefers the curated `dolma2()` preset for the dolma2/OLMo-2 family (its
+    `padded_vocab_size()` rounding matches the trainer expectations); otherwise
+    builds one directly from the HF tokenizer's special tokens.
+    """
+    identifier = tc.tokenizer_name_or_path or ""
+    dolma2_markers = ("dolma2", "OLMo-2-1124", "OLMo-2-0325", "OLMo-2-0425")
+    if any(marker in identifier for marker in dolma2_markers):
+        return OLMoCoreTokenizerConfig.dolma2()
+    eos_id = tc.tokenizer.eos_token_id
+    bos_id = tc.tokenizer.bos_token_id
+    # olmo-core's doc-boundary scanner requires an EOS *immediately followed by* BOS
+    # when both are set; when the tokenizer reuses the same id for both (e.g.
+    # olmo-3-tokenizer-instruct-dev has eos==bos==100257), that pattern never
+    # appears in practice, so fall back to the EOS-only scanner.
+    if bos_id == eos_id:
+        bos_id = None
+    return OLMoCoreTokenizerConfig(
+        vocab_size=tc.tokenizer.vocab_size,
+        eos_token_id=eos_id,
+        pad_token_id=tc.tokenizer.pad_token_id,
+        bos_token_id=bos_id,
+        identifier=identifier or None,
+    )
+
+
+def convert_olmo_core_state_to_hf(hf_config: transformers.PretrainedConfig, state_dict: dict[str, Any]) -> dict:
+    """Convert an olmo-core state dict to HF format, dispatching on model type.
+
+    Both the pre-training export check and the actual save go through here, so they
+    cannot disagree about which converter a model needs. olmo-core's converter has
+    no ``olmo_hybrid`` case and falls through to the llama-style key templates,
+    where it raises on every GDN parameter.
+    """
+    if getattr(hf_config, "model_type", None) == olmo_core_hybrid.OLMO_HYBRID_MODEL_TYPE:
+        return olmo_core_hybrid.convert_hybrid_state_to_hf(
+            state_dict, olmo_core_hybrid.layer_types_from_hf_config(hf_config)
+        )
+    return olmo_hf_convert.convert_state_to_hf(hf_config, state_dict)
+
+
+def verify_can_save_as_hf(model_config: TransformerConfig, original_model_name_or_path: str) -> None:
+    """Fail fast if the run cannot later be exported to HF format.
+
+    Builds the olmo-core model and the target HF model on meta, runs the
+    state-dict converter, and verifies the converted keys exactly cover the HF
+    model's expected parameters. Raises before any training starts.
+    """
+    hf_config = transformers.AutoConfig.from_pretrained(original_model_name_or_path, trust_remote_code=True)
+    olmo_core_model = model_config.build(init_device="meta")
+    olmo_core_state = olmo_core_model.state_dict()
+
+    converted = convert_olmo_core_state_to_hf(hf_config, olmo_core_state)
+
+    with accelerate.init_empty_weights():
+        hf_model = transformers.AutoModelForCausalLM.from_config(hf_config)
+    expected = set(hf_model.state_dict().keys())
+    produced = set(converted.keys())
+
+    missing = expected - produced
+    extra = produced - expected
+    if missing or extra:
+        raise RuntimeError(
+            f"HF export is not implemented for {original_model_name_or_path} "
+            f"(model_type={getattr(hf_config, 'model_type', None)}). "
+            f"Missing keys: {sorted(missing)}. Extra keys: {sorted(extra)}."
+        )
+    logger.info(
+        f"Verified HF export works for {original_model_name_or_path} "
+        f"(model_type={getattr(hf_config, 'model_type', None)}, {len(expected)} params)."
+    )
+
+
+#: Model types whose released checkpoints use transformers' in-memory weight naming, so
+#: save_pretrained must not apply its conversion_mapping in reverse on the way out.
+_MODERN_NAMING_MODEL_TYPES = {"olmo_hybrid"}
+
+
+def _set_hf_export_generation_config(hf_model, tokenizer: transformers.PreTrainedTokenizerBase) -> None:
+    if model_utils.uses_olmo3_generation_config(None, tokenizer, hf_model):
+        hf_model.generation_config = model_utils.get_olmo3_generation_config(tokenizer)
+
+
+def save_state_dict_as_hf(
+    state_dict: dict[str, torch.Tensor],
+    save_dir: str,
+    original_model_name_or_path: str,
+    tokenizer: transformers.PreTrainedTokenizerBase,
+) -> None:
+    """Convert an olmo-core state dict to HuggingFace format and save it to disk.
+
+    Loads the target HF config from ``original_model_name_or_path``, converts the
+    olmo-core ``state_dict`` keys/shapes to the matching HF layout, materializes
+    an HF model with those weights, and writes the model + tokenizer to
+    ``save_dir``.
+    """
+    hf_config = transformers.AutoConfig.from_pretrained(original_model_name_or_path, trust_remote_code=True)
+    converted = convert_olmo_core_state_to_hf(hf_config, state_dict)
+    converted = {k: v.contiguous() for k, v in converted.items()}
+
+    with accelerate.init_empty_weights():
+        hf_model = transformers.AutoModelForCausalLM.from_config(hf_config)
+    hf_model.load_state_dict(converted, assign=True)
+    _set_hf_export_generation_config(hf_model, tokenizer)
+
+    os.makedirs(save_dir, exist_ok=True)
+    model_type = getattr(hf_config, "model_type", None)
+    hf_model.save_pretrained(save_dir, save_original_format=model_type not in _MODERN_NAMING_MODEL_TYPES)
+    tokenizer.save_pretrained(save_dir)
+
+    index_path = os.path.join(save_dir, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path) as index_file:
+            saved = set(json.load(index_file)["weight_map"])
+    else:
+        # Reads only the header, not the tensors.
+        with safetensors.safe_open(os.path.join(save_dir, "model.safetensors"), framework="pt") as shard:
+            saved = set(shard.keys())
+    missing = sorted(set(converted) - saved)
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} converted tensors are absent from the saved checkpoint "
+            f"(e.g. {missing[:5]}); it will not load. Check whether transformers renamed "
+            f"them on save: the file contains {sorted(saved - set(converted))[:5]}. "
+            f"If model_type {model_type!r} publishes its checkpoints in the in-memory "
+            f"naming, add it to _MODERN_NAMING_MODEL_TYPES."
+        )
+
+
+def doc_lens_from_attention_mask(attention_mask_BS: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
+    """Convert an integer-coded packed attention_mask to OLMo-core ``doc_lens`` / ``max_doc_lens``.
+
+    ``attention_mask_BS`` is a ``(batch_size, sequence_length)`` integer tensor produced by the
+    packed-sequence collator: each token's value is the 1-indexed document ID it belongs to
+    (1, 2, 3, ...) within its row, and 0 marks padding. Tokens sharing a value belong to the same
+    document and are expected to be contiguous along the sequence dimension.
+
+    Padding spans (zeros in ``attention_mask_BS``) are emitted as their own segments: OLMo-core
+    flattens ``doc_lens`` into a single cumulative offset across the batch, so dropping padding
+    would shift subsequent rows' document boundaries into the previous row's padding region.
+    """
+    batch_size = attention_mask_BS.size(0)
+    rows = [torch.unique_consecutive(attention_mask_BS[i], return_counts=True)[1] for i in range(batch_size)]
+    max_docs = max(t.numel() for t in rows)
+    doc_lens_BD = torch.zeros((batch_size, max_docs), dtype=torch.int32, device=attention_mask_BS.device)
+    for i, t in enumerate(rows):
+        doc_lens_BD[i, : t.numel()] = t.to(torch.int32)
+    max_doc_lens_B = doc_lens_BD.max(dim=1).values.tolist()
+    return doc_lens_BD, max_doc_lens_B
+
+
+def doc_lens_from_cu_seq_lens(cu_seq_lens_k_D1: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, list[int]]:
+    """Convert flash-attn ``cu_seq_lens_k`` to OLMo-core ``doc_lens`` / ``max_doc_lens``.
+
+    ``cu_seq_lens_k_D1`` is a ``(num_docs + 1,)`` cumulative-offset tensor with a leading 0.
+    ``seq_len`` is the (possibly padded) length of the packed row; any trailing pad span is
+    emitted as its own segment so ``doc_lens`` sums to ``seq_len``, matching OLMo-core's
+    requirement that document boundaries cover the full sequence.
+    """
+    seq_lens_D = cu_seq_lens_k_D1.diff().to(torch.int32)
+    total = int(cu_seq_lens_k_D1[-1].item())
+    if total < seq_len:
+        pad_D = torch.tensor([seq_len - total], dtype=torch.int32, device=seq_lens_D.device)
+        seq_lens_D = torch.cat([seq_lens_D, pad_D])
+    doc_lens_BD = seq_lens_D.unsqueeze(0)
+    max_doc_lens_B = [int(doc_lens_BD.max().item())]
+    return doc_lens_BD, max_doc_lens_B
+
+
+def write_provenance_readme(
+    output_dir: str,
+    run_name: str,
+    model_name_or_path: str,
+    tracking_url: str | None,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
+) -> None:
+    """Drop a README.md into output_dir so any copy of the checkpoint traces back to its run.
+
+    Never overwrites an existing README (a resume must not clobber notes added
+    by hand) and never raises: provenance is not worth killing a run over.
+    """
+    path = os.path.join(output_dir, "README.md")
+    if os.path.exists(path):
+        return
+    try:
+        lines = [f"# {run_name}", ""]
+        if tracking_url:
+            lines.append(f"Tracking: {tracking_url}")
+        beaker_url = utils.get_beaker_experiment_url()
+        if beaker_url:
+            lines.append(f"Beaker experiment: {beaker_url}")
+        if wandb_project:
+            lines.append(f"W&B: {wandb_entity or 'ai2-llm'}/{wandb_project}, run name {run_name}")
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        lines += [
+            f"Base model: {model_name_or_path}",
+            f"Written at {timestamp}",
+            "",
+            "Command:",
+            "```",
+            # shlex.join, not " ".join: a run name or path with a space (or a `;`) would
+            # otherwise re-parse into different arguments when someone pastes this back.
+            shlex.join(sys.argv),
+            "```",
+        ]
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        logger.warning(f"Could not write provenance README to {output_dir}", exc_info=True)

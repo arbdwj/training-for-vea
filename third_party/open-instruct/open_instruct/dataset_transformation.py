@@ -1,0 +1,3085 @@
+# this file deals with dataset pre-processing before training
+
+# 1. PPO (prompt)
+# 2. SFT (prompt + demonstration), there is also packing.
+# 3. ✅ RM / DPO (chosen and rejected)
+# 4. ✅ Visualization of length distributions?
+# 5. ✅ Filter?
+# 6. ✅ dataset_num_proc
+# 7. ✅ check EOS token
+# 8. dataset mixer?
+# 9. ✅ pretty print that show tokenization?
+# 10. ✅ hashable tokneization?
+# 11. inputs / labels / attention_mask
+# 12. ✅ always set a `tokenizer.pad_token_id`?
+# 13. a new DataCollatorForLanguageModeling?
+# 14. ✅ `add_bos_token` and `add_eos_token`? E.g., LLAMA models
+# 15. ✅ generate properties: has eos_token, bos_token (through chat template)
+
+# ✅ get tokenizer revision
+# ✅ get dataset revision
+# create a cached tokenized dataset, with tokenized revision, dataset revision, tokenization function name.
+
+# too many names related to "maximum length":
+# * `max_seq_length` in SFT
+# * `max_length`, `max_target_length` in RM / DPO,
+# * `max_prompt_length` in DPO
+
+# TODO: note that tokenizer doesn't change but model name does change. Should be mindful of this.
+"""
+This file contains the utility to transform and cache datasets with different configurations.
+The main things we are looking for are:
+* handle dataset mixing
+* handle different tokenization functions
+* **cache** the tokenized dataset so we don't have to re-tokenize every time
+    * This is especially important when we have 405B SFT models: 32 nodes are just spending like
+    5 minutes to tokenize the dataset. This translates to 32 * 5 * 8 = 1280 minutes = 21 hours of
+    wasted H100 time.
+    * Sometimes we also launch on places that don't have a shared cache (e.g., GCP), so we would
+    download individual datasets 32 times, and wait for concatenation and tokenization (actually
+    twice because the `with accelerator.main_process_first()` function assumes a shared cache)
+
+
+## TODO: We should just simplify the tokenization setups. We have multiple "rlvr_tokenize", etc. This came from a previous version of version handling that prioritised backwards compatibility, but I think in practice we should just directly edit these functions + invalidate caches.
+"""
+
+import copy
+import difflib
+import hashlib
+import json
+import multiprocessing
+import os
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from functools import cached_property, lru_cache
+from typing import Any, Literal, cast
+
+import numpy as np
+import torch
+import transformers
+from datasets import Dataset, concatenate_datasets, load_dataset
+from huggingface_hub import ModelCard, revision_exists
+from rich.console import Console
+from rich.text import Text
+from tokenizers import Tokenizer
+from transformers import GPTNeoXTokenizerFast, LlamaTokenizer, LlamaTokenizerFast, PreTrainedTokenizer
+from transformers.utils import chat_template_utils
+from transformers.utils.hub import extract_commit_hash
+
+from open_instruct import dataset_statistics as token_statistics
+from open_instruct import launch_utils, logger_utils, tokenizer_utils
+from open_instruct.utils import hf_whoami, max_num_processes
+
+logger = logger_utils.setup_logger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# Utilities
+def get_commit_hash(
+    model_name_or_path: str, revision: str, filename: str = "config.json", repo_type: str = "model"
+) -> str | None:
+    file = launch_utils.custom_cached_file(model_name_or_path, filename, revision=revision, repo_type=repo_type)
+    commit_hash = extract_commit_hash(file, None)
+    return commit_hash
+
+
+def get_file_hash(
+    model_name_or_path: str, revision: str | None, filename: str = "config.json", repo_type: str = "model"
+) -> str:
+    file = launch_utils.custom_cached_file(model_name_or_path, filename, revision=revision, repo_type=repo_type)
+    if isinstance(file, str):
+        with open(file, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    elif file is None:
+        return f"{filename} not found"
+    else:
+        raise ValueError(f"Unexpected file type: {type(file)}")
+
+
+def get_files_hash_if_exists(
+    model_name_or_path: str, revision: str | None, filenames: list[str], repo_type: str = "model"
+) -> list[str]:
+    return [get_file_hash(model_name_or_path, revision, filename, repo_type) for filename in filenames]
+
+
+def _preserve_column(column_name: str, dataset, target_columns: list) -> list:
+    if column_name in dataset.column_names and column_name not in target_columns:
+        target_columns = target_columns + [column_name]
+    return target_columns
+
+
+# Performance tuning. Some rough numbers:
+APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU = 400
+FILTER_EXAMPLE_PER_SECOND_PER_CPU = 1130
+
+
+def get_num_proc(dataset_len: int, num_available_cpus: int, example_per_second_per_cpu) -> int:
+    num_required_cpus = max(1, dataset_len // example_per_second_per_cpu)
+    return min(num_required_cpus, num_available_cpus, dataset_len)
+
+
+COLORS = ["on red", "on green", "on blue", "on yellow", "on magenta"]
+
+
+def visualize_token(tokens: list[int], tokenizer: PreTrainedTokenizer):
+    i = 0
+    console = Console()
+    rich_text = Text()
+    for i, token in enumerate(tokens):
+        color = COLORS[i % len(COLORS)]
+        decoded_token = tokenizer.decode(int(token))
+        rich_text.append(f"{decoded_token}", style=color)
+    console.print(rich_text)
+
+
+def visualize_token_role(tokens: list[int], masks: list[int], tokenizer: PreTrainedTokenizer):
+    i = 0
+    console = Console()
+    rich_text = Text()
+    # for i, token in enumerate():
+    for i in range(min(len(tokens), len(masks))):
+        token = tokens[i]
+        color = COLORS[masks[i] % len(COLORS)]
+        decoded_token = tokenizer.decode(int(token))
+        rich_text.append(f"{decoded_token}", style=color)
+    console.print(rich_text)
+
+
+# ----------------------------------------------------------------------------
+# Tokenization
+# Chat templates
+# note we added `{% if loop.last and not add_generation_prompt %}{{ eos_token }}{% endif %}`
+# because we want the template to not output eos_token if `add_generation_prompt=True`
+#
+# SFT templates wrap assistant content in `{% generation %}` so
+# `return_assistant_tokens_mask=True` can label without prefix arithmetic.
+#
+# For Olmo 3 tokenizer settings and chat template decisions, see:
+# docs/olmo3.md (https://allenai.github.io/open-instruct/olmo3/#tokenizer-settings)
+CHAT_TEMPLATES = {
+    "simple_concat_with_space": (
+        "{% for message in messages %}"
+        "{{ ' ' if not loop.first else '' }}"
+        "{{ message['content'] }}"
+        "{% if loop.last and not add_generation_prompt %}{{ eos_token }}{% endif %}"
+        "{% endfor %}"
+    ),
+    "simple_concat_with_new_line": (
+        "{% for message in messages %}"
+        "{{ '\n' if not loop.first else '' }}"
+        "{{ message['content'] }}"
+        "{% if loop.last and not add_generation_prompt %}{{ eos_token }}{% endif %}"
+        "{% endfor %}"
+    ),
+    "simple_chat": (
+        "{% for message in messages %}"
+        "{{ '\n\n' if not loop.first else '' }}"
+        "{% if message['role'] == 'assistant' %}"
+        "{{ message['role'].capitalize() + ': ' }}"
+        "{% generation %}"
+        "{{ '' + message['content'] }}"
+        "{% if loop.last and not add_generation_prompt %}{{ eos_token }}{% endif %}"
+        "{% endgeneration %}"
+        "{% else %}"
+        "{{ message['role'].capitalize() + ': ' + message['content'] }}"
+        "{% if loop.last and not add_generation_prompt %}{{ eos_token }}{% endif %}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "assistant_message_only": (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'assistant' %}"
+        "{{ message['content'] }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "zephyr": (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}"
+        "{{ '<|user|>\n' + message['content'] + eos_token + '\n' }}"
+        "{% elif message['role'] == 'system' %}"
+        "{{ '<|system|>\n' + message['content'] + eos_token + '\n' }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|assistant|>\n' }}"
+        "{% generation %}"
+        "{{ message['content'] + eos_token }}"
+        "{% endgeneration %}"
+        "{{ '\n' }}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|assistant|>\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    # olmo-core-compatible chat templates:
+    # TODO: unify these 3 chat templates and send variables through the tokenizer's apply_chat_template kwargs
+    "olmo": (
+        "{% set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 %}"
+        "{% if not has_system %}"
+        "{{ '<|im_start|>system\nYou are OLMo, a helpful function-calling AI assistant built by Ai2. Your date cutoff is November 2024, and your model weights are available at https://huggingface.co/allenai. You do not currently have access to any functions. <functions></functions><|im_end|>\n' }}"
+        "{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|im_start|>system\n' + message['content'] }}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ ' <functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ ' You do not currently have access to any functions. <functions></functions><|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'user' %}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '\n' + '<functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% generation %}"
+        "{% if message.get('content', none) is not none %}"
+        "{{ message['content'] }}"
+        "{% endif %}"
+        "{% if message.get('function_calls', none) is not none %}"
+        "{{ '<function_calls>' + message['function_calls'] + '</function_calls>' }}"
+        "{% endif %}"
+        "{% if not loop.last %}"
+        "{{ '<|im_end|>' }}"
+        "{% else %}"
+        "{{ eos_token }}"
+        "{% endif %}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% elif message['role'] == 'environment' %}"
+        "{{ '<|im_start|>environment\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "tulu": (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|system|>\n' + message['content'] + '\n' }}"
+        "{% elif message['role'] == 'user' %}"
+        "{{ '<|user|>\n' + message['content'] + '\n' }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|assistant|>\n' }}"
+        "{% generation %}"
+        "{{ message['content'] + eos_token }}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|assistant|>\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "tulu_thinker": (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|system|>\n' + message['content'] + '\n' }}"
+        "{% elif message['role'] == 'user' %}"
+        "{{ '<|user|>\n' + message['content'] + '\n' }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{% set content = message['content'] %}"
+        "{{ '<|assistant|>\n' }}"
+        "{% generation %}"
+        "{{ content + eos_token }}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|assistant|>\n<think>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "tulu_thinker_r1_style": (
+        "A conversation between User and Assistant. "
+        "The user asks a question, and the Assistant solves it. "
+        "The assistant first thinks about the reasoning process in "
+        "the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think> </think> "
+        "and <answer> </answer> tags, respectively, "
+        "i.e., <think> reasoning process here </think> "
+        "<answer> answer here </answer>."
+        "\n\n"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|system|>\n' + message['content'] + '\n' }}"
+        "{% elif message['role'] == 'user' %}"
+        "{{ '<|user|>\n' + message['content'] + '\n' }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{% set content = message['content'] %}"
+        "{% if '</think>' in content %}"
+        "{% set content = content.split('</think>')[-1] %}"
+        "{% endif %}"
+        "{{ '<|assistant|>\n' }}"
+        "{% generation %}"
+        "{{ content + eos_token }}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|assistant|>\n<think>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    # olmo-core-compatible chat templates:
+    # TODO: unify these 3 chat templates and send variables through the tokenizer's apply_chat_template kwargs
+    "olmo_old": (
+        "{% set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 %}"
+        "{% if not has_system %}"
+        "{{ '<|im_start|>system\nYou are OLMo, a helpful function-calling AI assistant built by Ai2. Your date cutoff is November 2024, and your model weights are available at https://huggingface.co/allenai. You do not currently have access to any functions. <functions></functions><|im_end|>\n' }}"
+        "{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|im_start|>system\n' + message['content'] }}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ ' <functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ ' You do not currently have access to any functions. <functions></functions><|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'user' %}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '\n' + '<functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% generation %}"
+        "{% if message.get('content', none) is not none %}"
+        "{{ message['content'] }}"
+        "{% endif %}"
+        "{% if message.get('function_calls', none) is not none %}"
+        "{{ '<function_calls>' + message['function_calls'] + '</function_calls>' }}"
+        "{% endif %}"
+        "{% if not loop.last %}"
+        "{{ '<|im_end|>' }}"
+        "{% else %}"
+        "{{ eos_token }}"
+        "{% endif %}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% elif message['role'] == 'environment' %}"
+        "{{ '<|im_start|>environment\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "olmo_thinker": (
+        "{% set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 %}"
+        "{% if not has_system %}"
+        "{{ '<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|im_start|>system\n' + message['content'] }}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ ' <functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ ' You do not currently have access to any functions. <functions></functions><|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'user' %}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '\n' + '<functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% generation %}"
+        "{% if message.get('content', none) is not none %}"
+        "{{ message['content'] }}"
+        "{% endif %}"
+        "{% if message.get('function_calls', none) is not none %}"
+        "{{ '<function_calls>' + message['function_calls'] + '</function_calls>' }}"
+        "{% endif %}"
+        "{% if not loop.last %}"
+        "{{ '<|im_end|>' }}"
+        "{% else %}"
+        "{{ eos_token }}"
+        "{% endif %}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% elif message['role'] == 'environment' %}"
+        "{{ '<|im_start|>environment\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\n<think>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "olmo_thinker_no_think_7b": (
+        "{% set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 %}"
+        "{% if not has_system %}"
+        "{{ '<|im_start|>system\nYou are Olmo, a helpful AI assistant built by Ai2. Your date cutoff is December 2024, and your model weights are available at https://huggingface.co/allenai.<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|im_start|>system\n' + message['content'] }}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ ' <functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ ' You do not currently have access to any functions. <functions></functions><|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'user' %}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '\n' + '<functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% generation %}"
+        "{% if message.get('content', none) is not none %}"
+        "{{ message['content'] }}"
+        "{% endif %}"
+        "{% if message.get('function_calls', none) is not none %}"
+        "{{ '<function_calls>' + message['function_calls'] + '</function_calls>' }}"
+        "{% endif %}"
+        "{% if not loop.last %}"
+        "{{ '<|im_end|>' }}"
+        "{% else %}"
+        "{{ eos_token }}"
+        "{% endif %}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% elif message['role'] == 'environment' %}"
+        "{{ '<|im_start|>environment\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "olmo_thinker_remove_intermediate_thinking": (
+        "{% set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 %}"
+        "{% if not has_system %}"
+        "{{ '<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|im_start|>system\n' + message['content'] }}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ ' <functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ ' You do not currently have access to any functions. <functions></functions><|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'user' %}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '\n' + '<functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% generation %}"
+        "{% set content = message.get('content', none) %}"
+        "{% if content is not none %}"
+        "{% set content = content | string %}"
+        "{% if not loop.last and '</think>' in content and '<think>' in content %}"
+        "{% set content = content.split('</think>')[-1].lstrip('\\n') %}"
+        "{% endif %}"
+        "{{ content }}"
+        "{% endif %}"
+        "{% if message.get('function_calls', none) is not none %}"
+        "{{ '<function_calls>' + message['function_calls'] + '</function_calls>' }}"
+        "{% endif %}"
+        "{% if not loop.last %}"
+        "{{ '<|im_end|>' }}"
+        "{% else %}"
+        "{{ eos_token }}"
+        "{% endif %}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% elif message['role'] == 'environment' %}"
+        "{{ '<|im_start|>environment\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\n<think>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "olmo_thinker_no_think_sft_tokenization": (
+        "{% set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 %}"
+        "{% if not has_system %}"
+        "{{ '<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ '<|im_start|>system\n' + message['content'] }}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ ' <functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ ' You do not currently have access to any functions. <functions></functions><|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'user' %}"
+        "{% if message.get('functions', none) is not none %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '\n' + '<functions>' + message['functions'] + '</functions><|im_end|>\n' }}"
+        "{% else %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% generation %}"
+        "{% if message.get('content', none) is not none %}"
+        "{{ message['content'] }}"
+        "{% endif %}"
+        "{% if message.get('function_calls', none) is not none %}"
+        "{{ '<function_calls>' + message['function_calls'] + '</function_calls>' }}"
+        "{% endif %}"
+        "{% if not loop.last %}"
+        "{{ '<|im_end|>' }}"
+        "{% else %}"
+        "{{ eos_token }}"
+        "{% endif %}"
+        "{% endgeneration %}"
+        "{% if not loop.last %}{{ '\n' }}{% endif %}"
+        "{% elif message['role'] == 'environment' %}"
+        "{{ '<|im_start|>environment\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "olmo_thinker_rlzero": (
+        "Solve the following problem step by step. "
+        "The last line of your response should be the answer to the problem in form Answer: $Answer (without quotes) where $Answer is the answer to the problem."
+        "\n\n"
+        "{% for message in messages %}"
+        "{{ '\n\n' if not loop.first else '' }}"
+        "{{ message['content'] + '\n' }}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '\nRemember to put your answer on its own line after \"Answer:\"' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "olmo_thinker_code_rlzero": (
+        "Solve the following code problem step by step. "
+        "The last part of your response should be the solution to the problem in form ```\npython\nCODE\n``` where CODE is the solution for the problem."
+        "\n\n"
+        "{% for message in messages %}"
+        "{{ '\n\n' if not loop.first else '' }}"
+        "{{ message['content'] + '\n' }}"
+        "{% if loop.last and add_generation_prompt %}"
+        "\nRemember to put your solution inside the ```\npython\nCODE\n``` tags"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    # template is taken from https://arxiv.org/abs/2501.12948.
+    "r1_simple_chat": (
+        "A conversation between User and Assistant. "
+        "The user asks a question, and the Assistant solves it. "
+        "The assistant first thinks about the reasoning process in "
+        "the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think> </think> "
+        "and <answer> </answer> tags, respectively, "
+        "i.e., <think> reasoning process here </think> "
+        "<answer> answer here </answer>."
+        "\n\n"
+        "{% for message in messages %}"
+        "{{ '\n\n' if not loop.first else '' }}"
+        "{{ message['role'].capitalize() + ': ' + message['content'] + '\n' }}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ 'Assistant:' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "r1_simple_chat_postpend_think": (
+        "A conversation between User and Assistant. "
+        "The user asks a question, and the Assistant solves it. "
+        "The assistant first thinks about the reasoning process in "
+        "the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think> </think> "
+        "and <answer> </answer> tags, respectively, "
+        "i.e., <think> reasoning process here </think> "
+        "<answer> answer here </answer>."
+        "\n\n"
+        "{% for message in messages %}"
+        "{{ '\n\n' if not loop.first else '' }}"
+        "{{ message['role'].capitalize() + ': ' + message['content'] + '\n' }}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ 'Assistant: <think>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "r1_simple_chat_postpend_think_orz_style": (
+        "A conversation between User and Assistant. "
+        "The user asks a question, and the Assistant solves it. "
+        "The assistant first thinks about the reasoning process in "
+        "the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think> </think> "
+        "and <answer> </answer> tags, respectively, "
+        "i.e., <think> reasoning process here </think> "
+        "<answer> answer here </answer>."
+        "\n\n"
+        "{% for message in messages %}"
+        "{{ '\n\n' if not loop.first else '' }}"
+        "{{ message['role'].capitalize() + ': You must put your answer inside <answer> </answer> tags, i.e., <answer> answer here </answer>. And your final answer will be extracted automatically by the \\\\boxed{} tag. This is the problem: ' + message['content'] + '\n' }}"  # \\\\boxed{} is for jinja template escape
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ 'Assistant: <think>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "r1_simple_chat_postpend_think_tool_vllm": (
+        "A conversation between User and Assistant. "
+        "The User asks a question, and the Assistant solves it. "
+        "The Assistant first thinks about the reasoning process in "
+        "the mind and then provides the User with the answer. "
+        "\n\n"
+        "When given a question, the Assistant must conduct reasoning inside the <think> "
+        "and </think> tags. During reasoning, the Assistant may write and execute python "
+        "code using the <code> </code> tag, in order to solve the problem or verify the answer. "
+        "Then the Assistant will get the stdout and stderr in the <output> and </output> tags. "
+        "For example, the code could be\n"
+        "<code>\n"
+        "x, y = 1, 2\n"
+        "result = x + y\n"
+        "print(result)\n"
+        "</code>\n"
+        "or\n"
+        "<code>\n"
+        "import sympy as sp\n"
+        "from sympy import Symbol\n"
+        "x = Symbol('x')\n"
+        "y = Symbol('y')\n"
+        "solution = sp.solve(x**2 + y**2 - 1, (x, y))\n"
+        "print(solution)\n"
+        "</code>\n"
+        "The Assistant will always `print` the result of the code execution in order to see it in the <output> tag. "
+        "The Assistant may use the <code> </code> tag multiple times. "
+        "When the Assistant is done reasoning, it should provide the answer inside the <answer> "
+        "and </answer> tag."
+        "\n\n"
+        "{% for message in messages %}"
+        "{{ '\n\n' if not loop.first else '' }}"
+        "{{ message['role'].capitalize() + ': You must put your answer inside <answer> </answer> tags, i.e., <answer> answer here </answer>. And your final answer will be extracted automatically by the \\\\boxed{} tag. This is the problem: ' + message['content'] + '\n' }}"  # \\\\boxed{} is for jinjia template escape
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ 'Assistant: <think>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+    "qwen_instruct_user_boxed_math": (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}"
+        "{{ '<|im_start|>user\n' + message['content'] + '\n\nPlease reason step by step, and put your final answer within \\\\boxed{}<|im_end|>\n' }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+        "{% if loop.last and add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+    ),
+}
+
+
+def _validate_chat_template_name(name: str | None) -> None:
+    if name is None or name == "tokenizer_default" or name in CHAT_TEMPLATES:
+        return
+    suggestions = difflib.get_close_matches(name, CHAT_TEMPLATES, n=3, cutoff=0.4)
+    hint = f" Did you mean {', '.join(repr(s) for s in suggestions)}?" if suggestions else ""
+    raise ValueError(
+        f"Unknown chat template name {name!r}. Use one of {sorted(CHAT_TEMPLATES)} or 'tokenizer_default'.{hint}"
+    )
+
+
+def _set_chat_template(tc: "TokenizerConfig", tokenizer: PreTrainedTokenizer) -> None:
+    name = tc.chat_template_name
+    _validate_chat_template_name(name)
+    if name is None or name == "tokenizer_default":
+        if tokenizer.chat_template is None:
+            raise ValueError(f"Tokenizer {tc.tokenizer_name_or_path!r} does not define a chat template.")
+    else:
+        tokenizer.chat_template = CHAT_TEMPLATES[name]
+
+
+def get_tokenizer_simple_v1(tc: "TokenizerConfig"):
+    _validate_chat_template_name(tc.chat_template_name)
+    tokenizer = tokenizer_utils.load_tokenizer(
+        tc.tokenizer_name_or_path,
+        revision=tc.tokenizer_revision,
+        trust_remote_code=tc.trust_remote_code,
+        use_fast=tc.use_fast,
+    )
+    if tc.chat_template_name is not None:
+        _set_chat_template(tc, tokenizer)
+    return tokenizer
+
+
+def get_tokenizer_tulu_v1(tc: "TokenizerConfig"):
+    _validate_chat_template_name(tc.chat_template_name)
+    tokenizer = tokenizer_utils.load_tokenizer(
+        tc.tokenizer_name_or_path,
+        revision=tc.tokenizer_revision,
+        trust_remote_code=tc.trust_remote_code,
+        use_fast=tc.use_fast,
+    )
+    # no default pad token for llama!
+    # here we add all special tokens again, because the default ones are not in the special_tokens_map
+    # only add if the pad token is not present already.
+    if isinstance(tokenizer, (LlamaTokenizer, LlamaTokenizerFast)):
+        num_added_tokens = tokenizer.add_special_tokens(
+            {"bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>", "pad_token": "<pad>"}
+        )
+        assert num_added_tokens in [0, 1], (
+            "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
+        )
+    elif isinstance(tokenizer, GPTNeoXTokenizerFast):
+        # OLMo newer models use this tokenizer
+        if tokenizer.bos_token is None:
+            tokenizer.bos_token = tokenizer.eos_token
+            assert tc.add_bos, "For OLMo with GPTNeoX, you must add bos token to the beginning of the input sequence."
+        # else, pythia / other models
+        else:
+            num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+            assert num_added_tokens <= 1, (
+                "GPTNeoXTokenizer should only add one special token - the pad_token (or no tokens if already set in SFT)."
+            )
+    # NOTE: (Costa) I just commented the `OPTForCausalLM` because we are not likely to use it.
+    # elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
+    #     num_added_tokens = tokenizer.add_special_tokens({"unk_token": "<unk>"})
+    elif isinstance(tokenizer, transformers.PreTrainedTokenizerFast) and tokenizer.pad_token is None:
+        num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+        assert num_added_tokens == 1, "We detected no padding token but add_special_tokens did not add one."
+
+    # set the tokenizer chat template to the training format
+    # this will be used for encoding the training examples
+    # and saved together with the tokenizer to be used later.
+    _set_chat_template(tc, tokenizer)
+
+    if tc.add_bos:
+        if tokenizer.chat_template.startswith("{{ bos_token }}") or (
+            tokenizer.bos_token is not None and tokenizer.chat_template.startswith(tokenizer.bos_token)
+        ):
+            raise ValueError(
+                "You specified add_bos=True, but the chat template already has a bos_token at the beginning."
+            )
+        # also add bos in the chat template if not already there
+        tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
+
+    return tokenizer
+
+
+def get_tokenizer_tulu_v2_1(tc: "TokenizerConfig"):
+    _validate_chat_template_name(tc.chat_template_name)
+    tokenizer = tokenizer_utils.load_tokenizer(
+        tc.tokenizer_name_or_path,
+        revision=tc.tokenizer_revision,
+        trust_remote_code=tc.trust_remote_code,
+        use_fast=tc.use_fast,
+    )
+    # no default pad token for llama!
+    # here we add all special tokens again, because the default ones are not in the special_tokens_map
+    # only add if the pad token is not present already, or if the current one is set to eos_token_id.
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        if isinstance(tokenizer, (LlamaTokenizer, LlamaTokenizerFast)):
+            num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+            assert num_added_tokens in [0, 1], (
+                "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
+            )
+        elif isinstance(tokenizer, GPTNeoXTokenizerFast):
+            # OLMo newer models use this tokenizer
+            if tokenizer.bos_token is None:
+                tokenizer.bos_token = tokenizer.eos_token
+                assert tc.add_bos, (
+                    "For OLMo with GPTNeoX, you must add bos token to the beginning of the input sequence."
+                )
+            # else, pythia / other models
+            else:
+                num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+                assert num_added_tokens <= 1, (
+                    "GPTNeoXTokenizer should only add one special token - the pad_token (or no tokens if already set in SFT)."
+                )
+        # NOTE: (Costa) I just commented the `OPTForCausalLM` because we are not likely to use it.
+        # elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
+        #     num_added_tokens = tokenizer.add_special_tokens({"unk_token": "<unk>"})
+        elif isinstance(tokenizer, transformers.PreTrainedTokenizerFast):
+            num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+            assert num_added_tokens == 1, "We detected no padding token but add_special_tokens did not add one."
+
+    assert tokenizer.pad_token_id != tokenizer.eos_token_id, (
+        "pad token and eos token matching causes issues in our setup."
+    )
+
+    # set the tokenizer chat template to the training format
+    # this will be used for encoding the training examples
+    # and saved together with the tokenizer to be used later.
+    _set_chat_template(tc, tokenizer)
+
+    if tc.add_bos:
+        if tokenizer.chat_template.startswith("{{ bos_token }}") or (
+            tokenizer.bos_token is not None and tokenizer.chat_template.startswith(tokenizer.bos_token)
+        ):
+            raise ValueError(
+                "You specified add_bos=True, but the chat template already has a bos_token at the beginning."
+            )
+        # also add bos in the chat template if not already there
+        tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
+
+    return tokenizer
+
+
+def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
+    _validate_chat_template_name(tc.chat_template_name)
+    # @vwxyzjn: "olmo" handles both `olmo2` and `olmoe`.
+    if "olmo" in str(tc.tokenizer_name_or_path).lower():
+        if tc.chat_template_name is None or tc.chat_template_name == "tokenizer_default":
+            pass  # just assume the user knows what they're doing
+        elif "olmo" in tc.chat_template_name:
+            assert not tc.add_bos, "For newer OLMo chat templates, you must *not* run with `--add_bos`."
+        else:
+            assert tc.add_bos, "For OLMo, you must run with `--add_bos`."
+        assert tc.use_fast, "For OLMo, you must use fast tokenizer."
+
+    tokenizer = tokenizer_utils.load_tokenizer(
+        tc.tokenizer_name_or_path,
+        revision=tc.tokenizer_revision,
+        trust_remote_code=tc.trust_remote_code,
+        use_fast=tc.use_fast,
+    )
+    # no default pad token for llama!
+    # here we add all special tokens again, because the default ones are not in the special_tokens_map
+    # only add if the pad token is not present already, or if the current one is set to eos_token_id.
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        if isinstance(tokenizer, (LlamaTokenizer, LlamaTokenizerFast)):
+            num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+            assert num_added_tokens in [0, 1], (
+                "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
+            )
+        elif isinstance(tokenizer, GPTNeoXTokenizerFast):
+            # OLMo newer models use this tokenizer
+            if tokenizer.bos_token is None:
+                tokenizer.bos_token = tokenizer.eos_token
+                if tc.chat_template_name not in (None, "tokenizer_default") and "olmo" not in tc.chat_template_name:
+                    assert tc.add_bos, (
+                        "For OLMo with GPTNeoX, you must add bos token to the beginning of the input sequence "
+                        "if using an older chat template."
+                    )
+            # else, pythia / other models
+            else:
+                num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+                assert num_added_tokens <= 1, (
+                    "GPTNeoXTokenizer should only add one special token - the pad_token (or no tokens if already set in SFT)."
+                )
+        # NOTE: (Costa) I just commented the `OPTForCausalLM` because we are not likely to use it.
+        # elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
+        #     num_added_tokens = tokenizer.add_special_tokens({"unk_token": "<unk>"})
+        elif isinstance(tokenizer, transformers.PreTrainedTokenizerFast):
+            num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+            assert num_added_tokens == 1, "We detected no padding token but add_special_tokens did not add one."
+
+    assert tokenizer.pad_token_id != tokenizer.eos_token_id, (
+        "pad token and eos token matching causes issues in our setup."
+    )
+
+    # set the tokenizer chat template to the training format
+    # this will be used for encoding the training examples
+    # and saved together with the tokenizer to be used later.
+    _set_chat_template(tc, tokenizer)
+
+    if tc.add_bos:
+        if tokenizer.chat_template.startswith("{{ bos_token }}") or (
+            tokenizer.bos_token is not None and tokenizer.chat_template.startswith(tokenizer.bos_token)
+        ):
+            raise ValueError(
+                "You specified add_bos=True, but the chat template already has a bos_token at the beginning."
+            )
+        # also add bos in the chat template if not already there
+        tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
+
+    return tokenizer
+
+
+# ----------------------------------------------------------------------------
+# Reserved-slot token promotion
+
+RESERVED_SLOT_RE = re.compile(r"<\|extra_id_\d+\|>")
+"""Vocabulary entries the Olmo tokenizers set aside unused, for later use."""
+
+
+@dataclass(frozen=True)
+class PromotedToken:
+    """A string made into a single token by taking over an unused reserved vocabulary slot."""
+
+    content: str
+    token_id: int
+    source_ids: tuple[int, ...]
+    """The ids `content` tokenized into before promotion, to initialize its embedding row from."""
+
+
+def promote_tokens_into_reserved_slots(tokenizer: PreTrainedTokenizer, tokens: Sequence[str]) -> list[PromotedToken]:
+    """Make each of `tokens` a single token by renaming an unused reserved slot in place.
+
+    A multi-token tag is unreachable at inference whenever its last piece merges with the text
+    that follows it. `<think>` is `<th` `ink` `>`, and the Olmo BPE merges that `>` with what
+    comes next: a newline gives `>Ċ`, a blank line gives `>ĊĊ`, and `></` is one token. A
+    generation prompt ending in `<think>` therefore leaves the model in a state it was never
+    trained to continue from for any turn whose reasoning starts on the next line, or whose
+    think block is empty -- 27% of Dolci-Think traces and every Instruct turn under the olmo35
+    template. Promotion removes the merge: an added token is split out before BPE runs, under
+    either pre-tokenizer the same vocabulary may be loaded with
+    (https://github.com/allenai/open-instruct/issues/1896).
+
+    Renaming a reserved slot rather than appending keeps `vocab_size` and olmo-core's
+    `padded_vocab_size()` unchanged, so no checkpoint is resized and no embedding matrix changes
+    shape. This follows the precedent of `<functions>`/`<function_calls>`, which hold
+    `<|extra_id_1|>`..`<|extra_id_4|>`'s ids in `olmo-3-tokenizer-instruct-dev`.
+
+    The promoted tokens are deliberately *not* marked special: `skip_special_tokens=True` is the
+    default for vLLM detokenization, and the verifiers in `ground_truth_utils` split decoded
+    rollouts on a literal `</think>`.
+
+    Strings already registered as added tokens -- promoted earlier, or native to the tokenizer --
+    are skipped, so this is idempotent. A string that is one *ordinary* BPE token raises: it can
+    still merge with what follows it (`>` is one token, and so is `>\n`), and renaming a slot
+    would leave its trained id in use. Returns what it promoted, lowest slot id first.
+    """
+    added = set(tokenizer.get_added_vocab())
+    pending = []
+    for token in tokens:
+        if token in added:
+            continue
+        if len(tokenizer.encode(token, add_special_tokens=False)) == 1:
+            raise ValueError(
+                f"{token!r} is already one ordinary BPE token, which can still merge with what follows it; "
+                "--reserved_slot_tokens only makes multi-token strings atomic"
+            )
+        pending.append(token)
+    if not pending:
+        return []
+    source_ids = {token: tuple(tokenizer.encode(token, add_special_tokens=False)) for token in pending}
+
+    spec = json.loads(tokenizer.backend_tokenizer.to_str())
+    vocab = spec["model"]["vocab"]
+    # A slot already referenced by the chat template is load-bearing, whatever it is named.
+    # str() because a tokenizer may carry a dict of named templates rather than one string.
+    template = str(tokenizer.chat_template or "")
+    in_use = set(tokenizer.all_special_tokens) | set(RESERVED_SLOT_RE.findall(template))
+    free = [
+        entry
+        for entry in sorted(spec["added_tokens"], key=lambda entry: entry["id"])
+        if RESERVED_SLOT_RE.fullmatch(entry["content"]) and entry["content"] not in in_use
+    ]
+    if len(free) < len(pending):
+        raise ValueError(
+            f"Cannot promote {pending} in {tokenizer.name_or_path}: it has {len(free)} unused reserved "
+            f"slots but {len(pending)} are needed. Appending to the vocabulary instead would change "
+            "vocab_size, which resizes every checkpoint's embedding matrix and breaks the equality "
+            "olmo-core's padded_vocab_size() reload path depends on."
+        )
+
+    vocab_size_before, length_before = tokenizer.vocab_size, len(tokenizer)
+    promoted = []
+    for entry, content in zip(free, pending):
+        # The reserved token is usually in the BPE vocab as well as in added_tokens; rename it
+        # there too so the two agree on which id the slot holds.
+        slot_id = vocab.pop(entry["content"], None)
+        if slot_id is not None:
+            vocab[content] = slot_id
+        entry.update(content=content, special=False, normalized=False, lstrip=False, rstrip=False, single_word=False)
+        promoted.append(PromotedToken(content=content, token_id=entry["id"], source_ids=source_ids[content]))
+    tokenizer._tokenizer = Tokenizer.from_str(json.dumps(spec))
+
+    if (tokenizer.vocab_size, len(tokenizer)) != (vocab_size_before, length_before):
+        raise RuntimeError(
+            f"Promoting {pending} changed the vocabulary size from "
+            f"{(vocab_size_before, length_before)} to {(tokenizer.vocab_size, len(tokenizer))}; it must "
+            "only rename slots in place."
+        )
+    for token in promoted:
+        encoded = tokenizer.encode(token.content, add_special_tokens=False)
+        if encoded != [token.token_id]:
+            raise RuntimeError(
+                f"Promoted {token.content!r} into slot {token.token_id} but it still encodes to {encoded}."
+            )
+    logger.info(f"Promoted into reserved vocabulary slots: {[(t.content, t.token_id) for t in promoted]}")
+    return promoted
+
+
+GET_TOKENIZER_FN = {
+    "get_tokenizer_simple_v1": get_tokenizer_simple_v1,
+    "get_tokenizer_tulu_v1": get_tokenizer_tulu_v1,  # old version, see https://github.com/allenai/open-instruct/pull/570
+    "get_tokenizer_tulu_v2_1": get_tokenizer_tulu_v2_1,
+    "get_tokenizer_tulu_v2_2": get_tokenizer_tulu_v2_2,
+}
+
+DEFAULT_SFT_MESSAGES_KEY = "messages"
+GROUND_TRUTHS_KEY = "ground_truth"
+VERIFIER_SOURCE_KEY = "dataset"
+RAW_PROMPT_KEY = "prompt"
+
+
+@dataclass
+class TokenizerConfig:
+    tokenizer_name_or_path: str | None = None
+    tokenizer_revision: str | None = None
+    trust_remote_code: bool = False
+    use_fast: bool = True
+    chat_template_name: str | None = (
+        None  # CHAT_TEMPLATES key, or tokenizer_default / None for the tokenizer's own. Unknown names raise.
+    )
+    add_bos: bool = False
+    get_tokenizer_fn: str = "get_tokenizer_tulu_v2_2"
+    reserved_slot_tokens: list[str] | None = None
+    """Strings to make single tokens by renaming unused `<|extra_id_N|>` reserved vocabulary
+    entries in place, e.g. `--reserved_slot_tokens '<think>' '</think>'`. Leaving this unset
+    keeps the historical tokenization, and keeps the dataset cache key unchanged. See
+    `promote_tokens_into_reserved_slots` for why a multi-token tag is a training/inference
+    mismatch: https://github.com/allenai/open-instruct/issues/1869"""
+
+    # for tracking purposes
+    tokenizer_files_hash: list[str] | None = None
+
+    # backward compatibility to make sure script runs
+    use_slow_tokenizer: bool = False  # completely ignored
+    tokenizer_name: str | None = None
+    ground_truths_key: str = GROUND_TRUTHS_KEY
+    """columns name for the ground truth"""
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY
+    """columns name for the sft messages"""
+
+    @cached_property
+    def tokenizer(self):
+        if self.tokenizer_name_or_path is None:
+            raise ValueError("tokenizer_name_or_path must be set")
+        if self.tokenizer_name is not None and self.tokenizer_name_or_path is None:
+            if self.tokenizer_name != self.tokenizer_name_or_path:
+                raise ValueError(
+                    f"tokenizer_name and tokenizer_name_or_path are different: {self.tokenizer_name=} != {self.tokenizer_name_or_path=},"
+                    " you should use only `--tokenizer_name_or_path` in the future as `tokenizer_name` is deprecated."
+                )
+            self.tokenizer_name_or_path = self.tokenizer_name
+        tokenizer = GET_TOKENIZER_FN[self.get_tokenizer_fn](self)
+        # After the getter, so the chat template is set and can be scanned for slots it uses.
+        tokenizer.promoted_reserved_slot_tokens = (
+            promote_tokens_into_reserved_slots(tokenizer, self.reserved_slot_tokens)
+            if self.reserved_slot_tokens
+            else []
+        )
+        # Hash the tokenizer files only after loading the tokenizer: the hash
+        # helper only looks in the local HF cache, so on a fresh machine the
+        # files are present only after from_pretrained has downloaded them.
+        self.tokenizer_files_hash = get_files_hash_if_exists(
+            self.tokenizer_name_or_path,
+            self.tokenizer_revision,
+            filenames=["tokenizer_config.json", "tokenizer.json", "special_tokens_map.json", "vocab.json"],
+        )
+        return tokenizer
+
+
+# TODO: for testing, we should load the tokenizer from the sft / dpo / rl and make sure they are all the same.
+
+
+# ----------------------------------------------------------------------------
+# Dataset Transformation
+# SFT dataset
+INPUT_IDS_KEY = "input_ids"
+ATTENTION_MASK_KEY = "attention_mask"
+LABELS_KEY = "labels"
+MASKED_TOKEN_VALUE = -100
+DATASET_ORIGIN_KEY = "dataset_source"  # just 'dataset' clashes with RLVR stuff (see VERIFIER_SOURCE_KEY)
+TOKENIZED_SFT_DATASET_KEYS = [INPUT_IDS_KEY, ATTENTION_MASK_KEY, LABELS_KEY]
+TOKENIZED_SFT_DATASET_KEYS_WITH_SOURCE = [INPUT_IDS_KEY, ATTENTION_MASK_KEY, LABELS_KEY, DATASET_ORIGIN_KEY]
+
+
+def remove_dataset_source_field(dataset: Dataset) -> Dataset:
+    """Remove dataset_source field from dataset if it exists.
+
+    This should be called after statistics collection but before returning
+    the final dataset to avoid storing unnecessary metadata in cached datasets.
+    """
+    if DATASET_ORIGIN_KEY in dataset.column_names:
+        return dataset.remove_columns([DATASET_ORIGIN_KEY])
+    return dataset
+
+
+TOOLS_COLUMN_KEY = "tools"
+ENV_CONFIG_KEY = "env_config"
+EMPTY_DATASET_STATISTICS = {"per_dataset_stats": [], "dataset_order": []}
+
+# Cache version: increment this when transformation logic changes significantly
+# to invalidate old caches. v7: SFT tokenization passes the tools column to the chat
+# template (parsing JSON-string schemas) and derives assistant labels from offset mappings.
+# v8: preserve the serialized GPT-2 pre-tokenizer, including Dolma 2's Split regex, when
+# loading tokenizer-only repositories. v9: SFT and DPO derive assistant labels from
+# explicit generation ranges. v10: SFT and DPO decode JSON-string tool-call arguments
+# before rendering, which changes what templates that print a string argument verbatim render.
+DATASET_CACHE_VERSION = "v10"
+
+
+def _serializes_as_utf8(value: Any) -> bool:
+    """Whether a decoded JSON value can be rendered back as UTF-8 text, as templates and tokenizers need."""
+    try:
+        json.dumps(value, ensure_ascii=False).encode("utf-8")
+    except (UnicodeEncodeError, RecursionError):
+        return False
+    return True
+
+
+def _normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Parse JSON-string `tool_calls[].function.arguments` into mappings before rendering.
+
+    Arrow cannot hold a struct whose field types vary across rows, so datasets prepared for
+    open-instruct SFT (allenai/simfc-thinking-qwen35, allenai/nemotron-sft-agentic-v2-tool-calling-oi)
+    store each call's `arguments` as a JSON string. Chat templates that iterate the arguments
+    as a mapping (the Olmo 3.5 template's `| items`) reject the string, so decode it here.
+    Rows without tool calls, and calls whose arguments are already a mapping, pass through
+    unchanged. So does a string that does not decode to a JSON object (or `null`, read as `{}`),
+    or whose object cannot be written back as UTF-8 JSON (a lone surrogate such as `"\\ud800"`,
+    or nesting at the recursion limit): a template that needs a mapping still rejects it, and one
+    that prints the string or ignores tool calls renders the row as before. Messages are
+    shallow-copied where they change so the dataset row itself is not mutated.
+
+    A template that prints a string argument verbatim and serializes only mappings (Qwen's
+    `is string` branch) now renders its own `tojson` of the decoded mapping, so spacing and
+    escapes can differ from the dataset's string, and one that `tojson`s arguments unconditionally
+    renders the object instead of a JSON-encoded string. Callers: `_tokenize_row_or_mask_out`
+    (the SFT and DPO tulu tokenizers) and the added-token filter. The older `sft_tokenize_v1`,
+    `preference_tokenize_v1` and `rlvr_tokenize_*` paths render arguments as stored.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if not tool_calls:
+            out.append(message)
+            continue
+        new_calls = []
+        changed = False
+        for call in tool_calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            arguments = function.get("arguments") if isinstance(function, dict) else None
+            if isinstance(arguments, str):
+                try:
+                    decoded = json.loads(arguments)
+                except (ValueError, RecursionError):
+                    # Malformed JSON, an integer past Python's digit limit, or nesting too deep.
+                    decoded = arguments
+                if decoded is None:
+                    decoded = {}
+                if isinstance(decoded, dict) and _serializes_as_utf8(decoded):
+                    new_calls.append({**call, "function": {**function, "arguments": decoded}})
+                    changed = True
+                    continue
+            new_calls.append(call)
+        out.append({**message, "tool_calls": new_calls} if changed else message)
+    return out
+
+
+def _normalize_tools_for_chat_template(tools: Any) -> list | None:
+    """Normalize dataset tool schemas before passing them to chat templates."""
+    # pandas/CSV-backed datasets may represent a missing object cell as float('nan').
+    if tools is None or tools == "" or (isinstance(tools, float) and np.isnan(tools)):
+        return None
+
+    if isinstance(tools, str):
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{TOOLS_COLUMN_KEY} must be a JSON-encoded tool schema list, got: {tools!r}") from exc
+        # Re-check after parsing: a JSON "null" or "" decodes to None / "".
+        if tools is None or tools == "":
+            return None
+
+    if isinstance(tools, dict):
+        tools = [tools]
+
+    if not isinstance(tools, list):
+        raise TypeError(f"{TOOLS_COLUMN_KEY} must be a list, dict, JSON string, or None, got {type(tools).__name__}")
+
+    if not tools:
+        return None
+
+    if not all(isinstance(tool, dict) for tool in tools):
+        raise TypeError(f"{TOOLS_COLUMN_KEY} must contain JSON-schema dictionaries, got: {tools!r}")
+
+    return tools
+
+
+def _normalize_env_config_column(row: dict[str, Any]) -> None:
+    """Normalize row-level env_config to canonical dict form.
+
+    We turn dict-only or list-only configs into the same form.
+    """
+    env_config = row.get(ENV_CONFIG_KEY)
+    if env_config is None:
+        return
+
+    if isinstance(env_config, list):
+        row[ENV_CONFIG_KEY] = {"env_configs": [dict(cfg) for cfg in env_config]}
+        return
+
+    if not isinstance(env_config, dict):
+        raise TypeError(f"{ENV_CONFIG_KEY} must be a dict, list, or None, got {type(env_config).__name__}")
+
+    if "env_configs" in env_config:
+        normalized = dict(env_config)
+        normalized["env_configs"] = [dict(cfg) for cfg in (env_config.get("env_configs") or [])]
+        row[ENV_CONFIG_KEY] = normalized
+        return
+
+    if "env_name" in env_config:
+        single_env = dict(env_config)
+        max_steps = single_env.pop("max_steps", None)
+        normalized: dict[str, Any] = {"env_configs": [single_env]}
+        if max_steps is not None:
+            normalized["max_steps"] = max_steps
+        row[ENV_CONFIG_KEY] = normalized
+        return
+
+    row[ENV_CONFIG_KEY] = {"env_configs": []}
+
+
+def _normalize_env_config_row(row: dict[str, Any]) -> dict[str, Any]:
+    """HF map wrapper for env_config normalization."""
+    _normalize_env_config_column(row)
+    return row
+
+
+def validate_dataset_tools(dataset: Dataset, configured_tool_names: list[str], dataset_name: str = "dataset") -> None:
+    """Validate that configured tools match tools in dataset's 'tools' column.
+
+    The tools column is a list of tool call names (strings) that are active for each sample.
+    This function validates that all tools in the dataset are configured (no unknown tools).
+    Extraneous configured tools (not in dataset) are allowed but logged as a warning.
+
+    Args:
+        dataset: The dataset to validate.
+        configured_tool_names: List of tool names configured in the launch job
+            (e.g., ["python", "search"]).
+        dataset_name: Name of the dataset for error messages.
+
+    Raises:
+        ValueError: If dataset contains tools that are not configured.
+    """
+    if TOOLS_COLUMN_KEY not in dataset.column_names:
+        return
+
+    dataset_tool_names: set[str] = set()
+    for tools in dataset[TOOLS_COLUMN_KEY]:
+        if tools is not None:
+            dataset_tool_names.update(t for t in tools if t)
+
+    unconfigured_tools = dataset_tool_names - set(configured_tool_names)
+    if unconfigured_tools:
+        raise ValueError(
+            f"Dataset '{dataset_name}' contains tools {sorted(unconfigured_tools)} that are not configured. "
+            f"Configured tools: {configured_tool_names}. "
+            f"All tools in the dataset must be configured for execution."
+        )
+
+    # extraneous tools might happen e.g. if you subsample a dataset,
+    # and end up with no samples with some set of tools present in the entire dataset.
+    # or you might just accidentally include tools you don't need.
+    extraneous_tools = set(configured_tool_names) - dataset_tool_names
+    if extraneous_tools:
+        logger.warning(
+            f"Configured tools {sorted(extraneous_tools)} are not found in {dataset_name}'s "
+            f"'{TOOLS_COLUMN_KEY}' column. Tools found in dataset: {sorted(dataset_tool_names)}. "
+            f"These tools will be available but never used by this dataset."
+        )
+
+
+# Preference dataset
+# NOTE (Costa): the `INPUT_IDS_PROMPT_KEY` is just for visualization purposes only
+# also we don't really need `CHOSEN_ATTENTION_MASK_KEY` and `REJECTED_ATTENTION_MASK_KEY`
+# since we are always padding from the right with a collator; however they might become
+# more useful if we want to do some sort of packing in the future. The nice thing is
+# that the tokenization logic would work for both DPO and RM training.
+DEFAULT_CHOSEN_KEY = "chosen"
+DEFAULT_REJECTED_KEY = "rejected"
+CHOSEN_INPUT_IDS_KEY = "chosen_input_ids"
+CHOSEN_ATTENTION_MASK_KEY = "chosen_attention_mask"
+CHOSEN_LABELS_KEY = "chosen_labels"
+REJECTED_INPUT_IDS_KEY = "rejected_input_ids"
+REJECTED_ATTENTION_MASK_KEY = "rejected_attention_mask"
+REJECTED_LABELS_KEY = "rejected_labels"
+
+INPUT_IDS_PROMPT_KEY = "input_ids_prompt"
+ATTENTION_MASK_PROMPT_KEY = "attention_mask_prompt"
+
+TOKENIZED_PREFERENCE_DATASET_KEYS = [
+    CHOSEN_INPUT_IDS_KEY,
+    CHOSEN_LABELS_KEY,
+    CHOSEN_ATTENTION_MASK_KEY,
+    REJECTED_INPUT_IDS_KEY,
+    REJECTED_LABELS_KEY,
+    REJECTED_ATTENTION_MASK_KEY,
+]
+
+
+# TODO: allow passing in sft_message key, so we can train on "chosen" of pref dataset.
+def sft_tokenize_v1(
+    row: dict[str, Any], tokenizer: PreTrainedTokenizer, sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY
+):
+    prompt = row[sft_messages_key] if len(row[sft_messages_key]) == 1 else row[sft_messages_key][:-1]
+
+    # return_dict=False: transformers >= 5.0 defaults to returning a dict; we need a plain list of ints.
+    row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, return_dict=False)
+    row[INPUT_IDS_KEY] = tokenizer.apply_chat_template(row[sft_messages_key], return_dict=False)
+    row[ATTENTION_MASK_KEY] = [1] * len(row[INPUT_IDS_KEY])
+    labels = copy.deepcopy(row[INPUT_IDS_KEY])
+    row[LABELS_KEY] = labels
+    row.pop(RAW_PROMPT_KEY, None)
+    return row
+
+
+def sft_tokenize_mask_out_prompt_v1(
+    row: dict[str, Any], tokenizer: PreTrainedTokenizer, sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY
+):
+    """mask out the prompt tokens by manipulating labels"""
+    prompt = row[sft_messages_key] if len(row[sft_messages_key]) == 1 else row[sft_messages_key][:-1]
+
+    row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, return_dict=False)
+    row[INPUT_IDS_KEY] = tokenizer.apply_chat_template(row[sft_messages_key], return_dict=False)
+    row[ATTENTION_MASK_KEY] = [1] * len(row[INPUT_IDS_KEY])
+    labels = copy.deepcopy(row[INPUT_IDS_KEY])
+    labels[: len(row[INPUT_IDS_PROMPT_KEY])] = [-100] * len(row[INPUT_IDS_PROMPT_KEY])
+    row[LABELS_KEY] = labels
+    return row
+
+
+def sft_filter_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_prompt_token_length: int | None = None,
+    max_token_length: int | None = None,
+    need_contain_labels: bool = True,
+):
+    max_prompt_token_length_ok = True
+    if max_prompt_token_length is not None:
+        max_prompt_token_length_ok = len(row[INPUT_IDS_PROMPT_KEY]) <= max_prompt_token_length
+
+    max_token_length_ok = True
+    if max_token_length is not None:
+        max_token_length_ok = len(row[INPUT_IDS_KEY]) <= max_token_length
+
+    contain_some_labels = any(x != MASKED_TOKEN_VALUE for x in row[LABELS_KEY])
+    return max_prompt_token_length_ok and max_token_length_ok and (contain_some_labels or not need_contain_labels)
+
+
+def mask_labels(
+    labels: torch.Tensor,
+    messages: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    should_mask: Callable[[int, dict[str, Any], list[dict[str, Any]]], bool],
+) -> None:
+    """Mask spans in ``labels`` by setting them to -100.
+
+    ``should_mask(message_idx, message, messages)`` is called for each message
+    and should return True if that message's tokens should be masked (i.e. excluded
+    from the loss).
+
+    Some chat templates (e.g. Qwen3.5) crash when apply_chat_template receives a
+    prefix with only system/tool turns and no user turn.  Masking is deferred until
+    the prefix contains a user turn, then everything from position 0 is masked in
+    one shot.
+    """
+    chat_template_kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "return_tensors": "pt",
+        "return_dict": False,
+        "padding": False,
+        "truncation": max_seq_length is not None,
+        "max_length": max_seq_length,
+    }
+
+    deferred_from_zero = False
+    seen_user = False
+    for message_idx, message in enumerate(messages):
+        if message["role"] == "user":
+            seen_user = True
+
+        if not should_mask(message_idx, message, messages):
+            continue
+
+        # Defer: can't call apply_chat_template on a prefix with no user turn.
+        if not seen_user:
+            deferred_from_zero = True
+            continue
+
+        # Compute start of this message's token span.
+        if message_idx == 0 or deferred_from_zero:
+            # First message or catching up after deferred system/tool turns — start at 0.
+            message_start_idx = 0
+            deferred_from_zero = False
+        else:
+            message_start_idx = tokenizer.apply_chat_template(
+                conversation=messages[:message_idx], add_generation_prompt=False, **chat_template_kwargs
+            ).shape[1]
+
+        # Compute end of this message's token span. If the next turn is an
+        # assistant turn, include the generation prompt header in the masked
+        # region so it's excluded from the loss.
+        next_is_assistant = message_idx < len(messages) - 1 and messages[message_idx + 1]["role"] == "assistant"
+        message_end_idx = tokenizer.apply_chat_template(
+            conversation=messages[: message_idx + 1], add_generation_prompt=next_is_assistant, **chat_template_kwargs
+        ).shape[1]
+
+        labels[:, message_start_idx:message_end_idx] = MASKED_TOKEN_VALUE
+        if max_seq_length and message_end_idx >= max_seq_length:
+            break
+
+
+class AssistantSpanDerivationError(ValueError):
+    """Raised when a conversation's assistant label spans cannot be derived reliably."""
+
+
+def _trainable_assistant_indices(messages: list[dict[str, Any]], last_turn_only: bool) -> list[int]:
+    assistant_indices = [idx for idx, m in enumerate(messages) if m["role"] == "assistant"]
+    if last_turn_only:
+        return assistant_indices[-1:]
+    return assistant_indices
+
+
+def _assistant_token_spans_from_prefix_lengths(
+    messages: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizer,
+    tools: list | None,
+    max_seq_length: int | None,
+    trainable_indices: list[int],
+) -> list[tuple[int, int, int]]:
+    """Derive per-assistant-turn token spans from prefix token counts.
+
+    Unlike char offsets this does not require prefix-stable rendering, since it only counts
+    how many tokens each prefix produced. `tools` must be passed through: its absence is what
+    made this method wrong for tool-using conversations.
+
+    Returns (message_idx, start_token, end_token) per trainable assistant turn.
+    """
+    chat_template_kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "return_tensors": "pt",
+        "return_dict": False,
+        "padding": False,
+        "truncation": max_seq_length is not None,
+        "max_length": max_seq_length,
+        "tools": tools,
+    }
+    spans = []
+    for message_idx in trainable_indices:
+        # add_generation_prompt=True so the assistant header itself stays masked.
+        if message_idx == 0:
+            start = 0
+        else:
+            start = tokenizer.apply_chat_template(
+                conversation=messages[:message_idx], add_generation_prompt=True, **chat_template_kwargs
+            ).shape[1]
+        end = tokenizer.apply_chat_template(
+            conversation=messages[: message_idx + 1], add_generation_prompt=False, **chat_template_kwargs
+        ).shape[1]
+        spans.append((message_idx, start, end))
+    return spans
+
+
+def _verify_assistant_spans_cover_content(
+    messages: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizer,
+    input_ids: torch.Tensor,
+    rendered: str,
+    spans: list[tuple[int, int, int]],
+) -> None:
+    """Raise if a derived span does not line up with its assistant turn's content.
+
+    Catches the three ways the token-count derivation goes wrong: a span too narrow (drops
+    content from the loss), one starting inside the assistant header (leaks header tokens),
+    or one running past the turn (trains on the prompt). Turns whose content the template
+    rewrites are skipped, since there is nothing to compare against.
+    """
+    sequence_end = input_ids.shape[1]
+    for message_idx, start, end in spans:
+        content = messages[message_idx].get("content")
+        if not content or content not in rendered:
+            continue
+        truncated_tail = end >= sequence_end
+        start, end = max(0, start), min(end, sequence_end)
+        if start >= end:
+            continue
+        decoded = tokenizer.decode(input_ids[0, start:end], clean_up_tokenization_spaces=False)
+        # Truncated final span is fine if what survived is a prefix; checked first because the
+        # tests below assume the whole turn is present.
+        if truncated_tail and decoded.lstrip() and content.startswith(decoded.lstrip()):
+            continue
+        if content not in decoded:
+            raise AssistantSpanDerivationError(
+                f"Assistant label span for message {message_idx} does not cover its content: the span "
+                f"decodes to {decoded[:80]!r} but the message content starts {content[:40]!r}. The chat "
+                f"template renders turns in a way neither the offset nor the token-count derivation can "
+                f"follow, so labels would be silently misaligned."
+            )
+        # Must start at the content, not inside the header: a template without a generation
+        # prompt puts the boundary early, leaking header text that containment cannot see.
+        # Leading whitespace is allowed since a tokenizer may merge it into the first token.
+        if not decoded.lstrip().startswith(content):
+            raise AssistantSpanDerivationError(
+                f"Assistant label span for message {message_idx} starts inside the assistant header: "
+                f"the span decodes to {decoded[:80]!r}, which does not begin with the message content "
+                f"{content[:40]!r}. Header tokens would be included in the loss. This usually means the "
+                f"template does not support add_generation_prompt."
+            )
+        # Only look past this turn's own content: a short later turn ("Yes.") can otherwise
+        # collide with text inside a legitimate span.
+        tail = decoded[decoded.index(content) + len(content) :]
+        for later_idx in range(message_idx + 1, len(messages)):
+            later_content = messages[later_idx].get("content")
+            if later_content and later_content in tail:
+                raise AssistantSpanDerivationError(
+                    f"Assistant label span for message {message_idx} extends past its turn: the span "
+                    f"decodes to {decoded[:80]!r}, which contains message {later_idx} "
+                    f"({messages[later_idx]['role']}) content {later_content[:40]!r}. Labels would "
+                    f"include prompt tokens in the loss."
+                )
+
+
+def _tokenize_rendered_chat(
+    rendered: str, tokenizer: PreTrainedTokenizer, max_seq_length: int | None
+) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, bool]:
+    tokenized = tokenizer(
+        rendered,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        return_tensors="pt",
+        padding=False,
+        truncation=max_seq_length is not None,
+        max_length=max_seq_length,
+    )
+    input_ids = tokenized[INPUT_IDS_KEY]
+    offsets = tokenized["offset_mapping"][0].numpy()
+    truncated = _was_truncated(offsets, rendered, input_ids.shape[-1], max_seq_length)
+    return input_ids, tokenized[ATTENTION_MASK_KEY], offsets, truncated
+
+
+def _labels_from_char_spans(
+    input_ids: torch.Tensor, offsets: np.ndarray, spans: list[tuple[int, int]]
+) -> torch.Tensor:
+    """Train overlapping tokens, including boundary merges, but never zero-width offsets or spans."""
+    labels = torch.full_like(input_ids, MASKED_TOKEN_VALUE)
+    if len(offsets) == 0:
+        return labels
+    mask = np.zeros(len(offsets), dtype=bool)
+    for start, end in spans:
+        if start < end:
+            mask |= (offsets[:, 1] > start) & (offsets[:, 0] < end)
+    mask &= offsets[:, 0] < offsets[:, 1]
+    labels[0, mask] = input_ids[0, mask]
+    return labels
+
+
+def _last_assistant_generation_ranges(
+    messages: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizer,
+    tools: list | None,
+    rendered: str,
+    ranges: list[tuple[int, int]],
+    message_idx: int,
+) -> list[tuple[int, int]]:
+    """Locate the final assistant message without interpreting its inference prompt as a label boundary.
+
+    External templates may emit several blocks for one turn and none for another: equal
+    block/message counts do not prove ownership. Instead bound the turn by stable renders
+    before and through that message, then select complete blocks inside it. Olmo 3.5's
+    stable answer/tool-call terminators allow this even with trailing tool or user turns.
+    """
+    try:
+        before = (
+            tokenizer.apply_chat_template(
+                messages[:message_idx], tools=tools, tokenize=False, add_generation_prompt=False
+            )
+            if message_idx
+            else ""
+        )
+        through = tokenizer.apply_chat_template(
+            messages[: message_idx + 1], tools=tools, tokenize=False, add_generation_prompt=False
+        )
+    except Exception as exc:
+        raise AssistantSpanDerivationError("Cannot render prefixes to establish generation-block ownership.") from exc
+    if not (isinstance(before, str) and isinstance(through, str)):
+        raise AssistantSpanDerivationError("Expected text while establishing generation-block ownership.")
+    if not (through.startswith(before) and rendered.startswith(through)):
+        raise AssistantSpanDerivationError(
+            "Cannot establish generation-block ownership for the final assistant: conversation prefixes change "
+            "when later turns are rendered. Use a template with stable turn endings."
+        )
+    start, end = len(before), len(through)
+    selected = []
+    for block_start, block_end in ranges:
+        if block_start < end and start < block_end:
+            if block_start < start or block_end > end:
+                raise AssistantSpanDerivationError("A generation block crosses the final assistant message boundary.")
+            selected.append((block_start, block_end))
+    return selected
+
+
+def _verify_generation_terminators(
+    rendered: str, ranges: list[tuple[int, int]], tokenizer: PreTrainedTokenizer
+) -> None:
+    """Reject EOS or ChatML handoff tokens placed just outside the selected generation blocks.
+
+    Check the full render, before truncation: a cut-off response is handled separately by
+    over_length_strategy. Blocks may split reasoning, answers and terminators, and templates
+    without a closing token are allowed. An arbitrary special token is not necessarily a
+    terminator, so other special tokens produce a warning instead of rejecting the row.
+    """
+    terminators = {token for token in (tokenizer.eos_token, "<|im_end|>") if token}
+    for start, end in ranges:
+        if start == end:
+            continue
+        terminator_start = end
+        while terminator_start < len(rendered) and rendered[terminator_start].isspace():
+            terminator_start += 1
+        for terminator in terminators | set(tokenizer.all_special_tokens):
+            if rendered.startswith(terminator, terminator_start):
+                terminator_end = terminator_start + len(terminator)
+                # A terminator may itself occupy a separate generation block.
+                covered_until = terminator_start
+                for block_start, block_end in sorted(ranges):
+                    if block_start <= covered_until < block_end:
+                        covered_until = block_end
+                if covered_until < terminator_end:
+                    if terminator in terminators:
+                        raise AssistantSpanDerivationError(
+                            f"Assistant terminator {terminator!r} is outside the generation blocks. "
+                            "Include the closing token inside {% generation %} so the model learns to stop or hand off."
+                        )
+                    logger.warning(
+                        f"Special token {terminator!r} immediately follows a generation block but is not covered "
+                        "by one. If it terminates the assistant turn, include it inside {% generation %}; "
+                        "if it starts the next turn, leaving it masked is correct."
+                    )
+
+
+def _tokenize_tulu_sft_with_assistant_labels(
+    messages: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizer,
+    tools: list | None,
+    max_seq_length: int | None,
+    last_turn_only: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    # Assistant label spans are derived from `return_offsets_mapping`, which slow
+    # (Python) tokenizers do not support. Fail with a clear message instead of the
+    # opaque ValueError/NotImplementedError the tokenizer would raise.
+    if not getattr(tokenizer, "is_fast", False):
+        raise ValueError(
+            f"SFT tokenization requires a fast tokenizer because it relies on "
+            f"`return_offsets_mapping` to derive assistant label spans, but got a slow tokenizer "
+            f"({type(tokenizer).__name__}). Load the tokenizer with `use_fast=True`."
+        )
+    # Render generation ranges directly instead of using Transformers' flattened
+    # assistant mask. The flattened mask loses block boundaries and, with left
+    # truncation, stops after the first range whose start was truncated away.
+    # render_jinja_template is a Transformers-internal API; the rendering-contract
+    # tests guard its generation-range behavior when upgrading Transformers.
+    template = tokenizer.get_chat_template(tools=tools)
+    has_generation_blocks = isinstance(template, str) and re.search(r"\{\%[-+]?\s*generation\s*[-+]?\%\}", template)
+    if has_generation_blocks:
+        rendered_chats, generation_indices = chat_template_utils.render_jinja_template(
+            conversations=[messages],
+            tools=tools,
+            chat_template=template,
+            return_assistant_tokens_mask=True,
+            add_generation_prompt=False,
+            **cast(dict[str, Any], tokenizer.special_tokens_map),
+        )
+        rendered = rendered_chats[0]
+    else:
+        rendered = tokenizer.apply_chat_template(
+            conversation=messages, tools=tools, tokenize=False, add_generation_prompt=False
+        )
+    assert isinstance(rendered, str)
+    input_ids, attention_mask, offsets, truncated = _tokenize_rendered_chat(rendered, tokenizer, max_seq_length)
+    labels = torch.full_like(input_ids, MASKED_TOKEN_VALUE)
+    if has_generation_blocks:
+        assistant_indices = _trainable_assistant_indices(messages, last_turn_only=False)
+        if not assistant_indices:
+            return input_ids, attention_mask, labels, truncated
+        ranges = cast(list[tuple[int, int]], generation_indices[0])
+        if not any(start < end for start, end in ranges):
+            raise AssistantSpanDerivationError(
+                "Chat template contains {% generation %} blocks but rendered no non-empty assistant spans, "
+                "so labels would train on nothing."
+            )
+        if last_turn_only:
+            # Tokenizer loaders prepend this exact BOS expression. It changes neither
+            # block ownership nor the one-block-per-assistant contract of our templates.
+            if template.removeprefix("{{ bos_token }}") in CHAT_TEMPLATES.values():
+                if len(ranges) != len(assistant_indices):
+                    raise AssistantSpanDerivationError(
+                        "Registered SFT templates must render exactly one {% generation %} span per assistant turn, "
+                        f"but found {len(ranges)} spans for {len(assistant_indices)} assistant turns."
+                    )
+                ranges = ranges[-1:]
+            else:
+                ranges = _last_assistant_generation_ranges(
+                    messages, tokenizer, tools, rendered, ranges, assistant_indices[-1]
+                )
+        _verify_generation_terminators(rendered, ranges, tokenizer)
+        labels = _labels_from_char_spans(input_ids, offsets, ranges)
+        return input_ids, attention_mask, labels, truncated
+
+    trainable_indices = _trainable_assistant_indices(messages, last_turn_only)
+
+    # Set when a prefix render is not a literal prefix of the full render, making char offsets
+    # meaningless. Templates that special-case the final turn hit this routinely, so fall back
+    # to token counts rather than refusing the conversation.
+    prefix_unstable = False
+
+    trainable_char_spans: list[tuple[int, int]] = []
+    for message_idx in trainable_indices:
+        # The trainable span runs from the end of the assistant header (the generation
+        # prompt the template emits before the assistant's content) to the end of the
+        # assistant turn, i.e. content + closing tokens. ``header`` and ``through`` are
+        # taken as char offsets into the full ``rendered`` string (which is what we
+        # tokenize), so both must be a prefix of it; if not, the template/conversation
+        # is not prefix-stable (e.g. eos appended only on the final turn) and we fall
+        # back to token-count derivation below. ``messages[:0]`` is empty for an
+        # assistant opening turn, so the header is taken as empty there.
+        #
+        # Rendering a partial conversation is itself template-dependent: some templates
+        # (e.g. Qwen3.5) raise when handed a prefix containing only system/tool turns and
+        # no user turn, which happens when the first assistant turn is not preceded by a
+        # user turn (``[system, assistant, ...]``). We cannot derive the span boundary
+        # without that render, so surface an actionable error rather than the template's
+        # opaque one.
+        try:
+            if message_idx == 0:
+                header = ""
+            else:
+                header = tokenizer.apply_chat_template(
+                    conversation=messages[:message_idx], tools=tools, tokenize=False, add_generation_prompt=True
+                )
+            through = tokenizer.apply_chat_template(
+                conversation=messages[: message_idx + 1], tools=tools, tokenize=False, add_generation_prompt=False
+            )
+        except Exception as exc:
+            roles = [m["role"] for m in messages[: message_idx + 1]]
+            raise AssistantSpanDerivationError(
+                f"Chat template {type(tokenizer).__name__} failed to render the conversation prefix "
+                f"{roles} while deriving assistant label spans for message {message_idx}. Some "
+                f"templates reject prefixes that contain no user turn; such conversations are not "
+                f"supported by this tokenization path."
+            ) from exc
+        assert isinstance(header, str)
+        assert isinstance(through, str)
+        if not (len(header) <= len(through) and rendered.startswith(header) and rendered.startswith(through)):
+            prefix_unstable = True
+            break
+        trainable_char_spans.append((len(header), len(through)))
+
+    if prefix_unstable:
+        token_spans = _assistant_token_spans_from_prefix_lengths(
+            messages, tokenizer, tools, max_seq_length, trainable_indices
+        )
+        for _, start, end in token_spans:
+            start, end = max(0, start), min(end, input_ids.shape[1])
+            if start < end:
+                labels[0, start:end] = input_ids[0, start:end]
+        _verify_assistant_spans_cover_content(messages, tokenizer, input_ids, rendered, token_spans)
+        return input_ids, attention_mask, labels, truncated
+
+    labels = _labels_from_char_spans(input_ids, offsets, trainable_char_spans)
+
+    return input_ids, attention_mask, labels, truncated
+
+
+DEFAULT_OVER_LENGTH_STRATEGY = "keep"
+OVER_LENGTH_STRATEGIES = (DEFAULT_OVER_LENGTH_STRATEGY, "terminate", "drop")
+
+
+def sft_tokenize_fn_args(max_seq_length: int | None, over_length_strategy: str) -> dict[str, Any]:
+    """Build the `transform_fn_args` entry for the SFT tokenizer.
+
+    `over_length_strategy` is omitted at its default so existing dataset cache hashes (a JSON
+    encoding of these args) are unchanged; opting in still yields a distinct hash.
+    """
+    fn_args: dict[str, Any] = {"max_seq_length": max_seq_length}
+    if over_length_strategy != DEFAULT_OVER_LENGTH_STRATEGY:
+        fn_args["over_length_strategy"] = over_length_strategy
+    return fn_args
+
+
+# SFT tokenizers that take `max_seq_length` / `over_length_strategy`.
+_SFT_TRUNCATING_TOKENIZE_FNS = {"sft_tulu_tokenize_and_truncate_v1", "last_turn_tulu_tokenize_and_truncate_v1"}
+
+
+def sft_transform_fn_args(
+    transform_fn: Sequence[str], max_seq_length: int | None, over_length_strategy: str
+) -> list[dict[str, Any]]:
+    """Build `transform_fn_args` for an SFT `transform_fn` list, one entry per function by name.
+
+    Truncating tokenizers get :func:`sft_tokenize_fn_args`; every other function gets `{}`. For
+    the default `[sft_tulu_tokenize_and_truncate_v1, sft_tulu_filter_v1]` this is the
+    `[sft_tokenize_fn_args(...), {}]` the SFT entry points always passed, so existing dataset
+    cache hashes are unchanged; it also lets a filter such as
+    `sft_added_token_strings_filter_v2` run ahead of the tokenizer.
+    """
+    return [
+        sft_tokenize_fn_args(max_seq_length, over_length_strategy) if fn_name in _SFT_TRUNCATING_TOKENIZE_FNS else {}
+        for fn_name in transform_fn
+    ]
+
+
+def _was_truncated(
+    offsets: Sequence[Sequence[int]] | np.ndarray, rendered: str, n_tokens: int, max_seq_length: int | None
+) -> bool:
+    """Whether `max_seq_length` truncation dropped part of `rendered`.
+
+    Sitting at the cap is not sufficient (a render can be exactly that long) and the final token
+    not being EOS is neither necessary nor sufficient, so check both ends of the render.
+    Ignore zero-width offsets, which do not represent retained text.
+    """
+    if max_seq_length is None or n_tokens < max_seq_length:
+        return False
+    if len(offsets) == 0:
+        return False
+    offsets = np.asarray(offsets)
+    nonempty = offsets[offsets[:, 0] < offsets[:, 1]]
+    if len(nonempty) == 0:
+        return False
+    return bool(nonempty[:, 0].min() > 0 or nonempty[:, 1].max() < len(rendered))
+
+
+def _apply_over_length_strategy(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    tokenizer: PreTrainedTokenizer,
+    truncated: bool,
+    over_length_strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Handle a conversation that `max_seq_length` truncation cut short.
+
+    Right-sided truncation drops the trailing EOS, so a cut inside an assistant turn leaves
+    trainable text with no terminator. `keep` leaves the row as is, `terminate` replaces its
+    final token with a trainable EOS, `drop` masks it out so `sft_tulu_filter_v1` removes it.
+    Left-sided truncation also triggers `drop`, but `terminate` preserves the intact tail.
+    """
+    if over_length_strategy not in OVER_LENGTH_STRATEGIES:
+        raise ValueError(f"over_length_strategy must be one of {OVER_LENGTH_STRATEGIES}, got {over_length_strategy!r}")
+    if over_length_strategy == DEFAULT_OVER_LENGTH_STRATEGY or not truncated:
+        return input_ids, labels
+    if over_length_strategy == "drop":
+        return input_ids, torch.full_like(labels, MASKED_TOKEN_VALUE)
+    if tokenizer.truncation_side == "left":
+        return input_ids, labels
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise ValueError(
+            f"over_length_strategy={over_length_strategy!r} needs an EOS token, but "
+            f"{type(tokenizer).__name__} has eos_token_id=None."
+        )
+    # A cut in a masked span (a non-assistant turn, or a row masked out entirely) has no
+    # unterminated supervision to repair; a trainable EOS there would be wrong or would rescue
+    # a row the filter should drop.
+    if labels[0, -1].item() == MASKED_TOKEN_VALUE:
+        return input_ids, labels
+    input_ids[0, -1] = eos_token_id
+    labels[0, -1] = eos_token_id
+    return input_ids, labels
+
+
+def _tokenize_row_or_mask_out(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int | None,
+    last_turn_only: bool = False,
+    over_length_strategy: str = "keep",
+) -> dict[str, Any]:
+    """Tokenize one conversation, masking the whole row out if its labels are underivable.
+
+    Such rows are rare (~0.005% of tulu-3-sft-olmo-2-mixture) but a raise inside
+    `dataset.map` aborts the entire job, so an all-masked row is returned instead and
+    `sft_tulu_filter_v1` drops it. Masking out only ever follows a *detected* failure; an
+    unverified span is never trained on.
+    """
+    messages = row["messages"]
+    if len(messages) == 0:
+        raise ValueError("messages field is empty.")
+    messages = _normalize_tool_call_arguments(messages)
+    tools = _normalize_tools_for_chat_template(row.get(TOOLS_COLUMN_KEY))
+    try:
+        input_ids, attention_mask, labels, truncated = _tokenize_tulu_sft_with_assistant_labels(
+            messages, tokenizer, tools, max_seq_length, last_turn_only=last_turn_only
+        )
+    except AssistantSpanDerivationError as exc:
+        logger.warning(
+            f"Dropping a conversation whose assistant label spans could not be derived "
+            f"({[m['role'] for m in messages]}): {exc}"
+        )
+        rendered = tokenizer.apply_chat_template(conversation=messages, tools=tools, tokenize=False)
+        assert isinstance(rendered, str)
+        input_ids, attention_mask, _, truncated = _tokenize_rendered_chat(rendered, tokenizer, max_seq_length)
+        labels = torch.full_like(input_ids, MASKED_TOKEN_VALUE)
+    input_ids, labels = _apply_over_length_strategy(input_ids, labels, tokenizer, truncated, over_length_strategy)
+    row[INPUT_IDS_KEY] = input_ids.flatten()
+    row[LABELS_KEY] = labels.flatten()
+    row[ATTENTION_MASK_KEY] = attention_mask.flatten()
+    return row
+
+
+def _sft_tulu_tokenize(
+    row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int | None, over_length_strategy: str = "keep"
+):
+    """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
+    return _tokenize_row_or_mask_out(row, tokenizer, max_seq_length, over_length_strategy=over_length_strategy)
+
+
+def sft_tulu_tokenize_without_truncation_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer):
+    return _sft_tulu_tokenize(row, tokenizer, max_seq_length=None)
+
+
+def sft_tulu_tokenize_and_truncate_v1(
+    row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int, over_length_strategy: str = "keep"
+):
+    """Tokenize a conversation, truncating it to ``max_seq_length``.
+
+    ``over_length_strategy`` (``keep``, ``terminate``, ``drop``) decides what happens to a
+    conversation that truncation cut short; see :func:`_apply_over_length_strategy`.
+    """
+    return _sft_tulu_tokenize(row, tokenizer, max_seq_length=max_seq_length, over_length_strategy=over_length_strategy)
+
+
+def last_turn_tulu_tokenize_and_truncate_v1(
+    row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int, over_length_strategy: str = "keep"
+):
+    """Tokenize a conversation, training only on the final assistant turn.
+
+    Reuses the offset-based assistant-label derivation (which forwards the tools
+    column to the chat template) rather than the legacy mask_labels path.
+    """
+    return _tokenize_row_or_mask_out(
+        row, tokenizer, max_seq_length, last_turn_only=True, over_length_strategy=over_length_strategy
+    )
+
+
+def sft_tulu_filter_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer):
+    return any(x != MASKED_TOKEN_VALUE for x in row[LABELS_KEY])
+
+
+DEFAULT_ADDED_TOKEN_STRINGS_ALLOWED_IN_CONTENT = (
+    # The olmo35 template carries reasoning inline in assistant content, and
+    # `--reserved_slot_tokens '<think>' '</think>'` (#1911) makes these added tokens.
+    "<think>",
+    "</think>",
+    # Added tokens in olmo-3-tokenizer-instruct-dev, whose system prompt tells the model to
+    # write its function calls inside these tags, i.e. in assistant content.
+    "<functions>",
+    "</functions>",
+    "<function_calls>",
+    "</function_calls>",
+)
+"""Added-token strings that `sft_added_token_strings_filter_v2` leaves in message content."""
+
+
+@lru_cache(maxsize=16)
+def _added_token_strings_pattern(added_strings: tuple[str, ...], allowed: frozenset[str]) -> re.Pattern[str] | None:
+    banned = [s for s in added_strings if s and s not in allowed]
+    return re.compile("|".join(re.escape(s) for s in banned)) if banned else None
+
+
+def _content_text(content: Any) -> str:
+    """The text a message's `content` renders: a plain string, or its list parts' text joined.
+
+    Parts are joined without a separator, as the Olmo chat templates render them, so a string
+    split across two parts is still found.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list | tuple):
+        return "".join(
+            part if isinstance(part, str) else part["text"]
+            for part in content
+            if isinstance(part, str) or (isinstance(part, Mapping) and isinstance(part.get("text"), str))
+        )
+    return ""
+
+
+def find_added_token_strings(
+    messages: Sequence[Mapping[str, Any]] | None,
+    tokenizer: PreTrainedTokenizer,
+    allowed_strings: Sequence[str] | None = None,
+) -> list[str]:
+    """Sorted distinct strings from `tokenizer`'s added vocabulary that `messages`' content encodes to.
+
+    A substring search finds candidate rows; each candidate's content is then encoded, and a
+    string counts only if its token id comes out. That leaves `single_word`, normalization and
+    the other `AddedToken` matching rules to the tokenizer, and costs an encode only for the rare
+    rows that contain a candidate. `allowed_strings` defaults to
+    `DEFAULT_ADDED_TOKEN_STRINGS_ALLOWED_IN_CONTENT`. The added vocabulary is read on every call
+    rather than cached per tokenizer, since promotion into reserved slots edits a tokenizer in
+    place.
+    """
+    allowed = frozenset(DEFAULT_ADDED_TOKEN_STRINGS_ALLOWED_IN_CONTENT if allowed_strings is None else allowed_strings)
+    added_ids = {token.content: token_id for token_id, token in tokenizer.added_tokens_decoder.items()}
+    pattern = _added_token_strings_pattern(tuple(added_ids), allowed)
+    if pattern is None:
+        return []
+    found: set[str] = set()
+    for message in messages or []:
+        if not isinstance(message, Mapping):
+            continue
+        text = _content_text(message.get("content"))
+        if pattern.search(text) is None:
+            continue
+        encoded = set(tokenizer.encode(text, add_special_tokens=False))
+        found.update(s for s, token_id in added_ids.items() if s not in allowed and s in text and token_id in encoded)
+    return sorted(found)
+
+
+def sft_added_token_strings_filter_v2(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+    allowed_strings: Sequence[str] | None = None,
+) -> bool:
+    """Drop a row whose message content, reasoning, tool calls or tools contain a literal added-token string.
+
+    A string from the tokenizer's added vocabulary (`tokenizer.get_added_vocab()`) inside
+    content encodes to that token's id, not to text: under the olmo35 tokenizer an
+    `<|endoftext|>` in an assistant answer is an EOS mid-response, and an `<|im_start|>` in a
+    user turn opens a fake turn. The olmo35 template also renders `reasoning_content`,
+    `tool_calls` and the `tools` schemas, so those are checked too. `allowed_strings` (default
+    `DEFAULT_ADDED_TOKEN_STRINGS_ALLOWED_IN_CONTENT`) lists the strings a chat template expects
+    inside content; it applies to content only. The other fields allow no added token, since the
+    template wraps `reasoning_content` in `<think>`...`</think>` itself and a literal `</think>`
+    there would close the block early. The SFT entry points pass this filter no arguments
+    (`sft_transform_fn_args`), so training from the CLI always uses the default allowlist;
+    `allowed_strings` is for direct callers. Plain-text look-alikes such as `</s>` are not added
+    tokens and are kept.
+
+    Opt-in. It reads `messages`, which the SFT tokenizers drop, so it has to run before them:
+
+        --dataset_transform_fn sft_added_token_strings_filter_v2 sft_tulu_tokenize_and_truncate_v1 sft_tulu_filter_v1
+
+    (`--transform_fn` for `olmo_core_finetune.py`). Enabling it changes the dataset cache hash;
+    leaving it off keeps existing hashes. `get_dataset_v1` logs how many rows it removed per
+    dataset.
+    """
+    if sft_messages_key not in row:
+        raise KeyError(
+            f"sft_added_token_strings_filter_v2 needs the {sft_messages_key!r} column; list it before the "
+            "tokenization function in the transform list, which drops that column."
+        )
+    if find_added_token_strings(row[sft_messages_key], tokenizer, allowed_strings):
+        return False
+    texts = _non_content_texts(row, sft_messages_key)
+    return not find_added_token_strings([{"content": text} for text in texts], tokenizer, allowed_strings=())
+
+
+def _non_content_texts(row: Mapping[str, Any], sft_messages_key: str) -> list[str]:
+    """The other raw fields the olmo35 template renders: reasoning, tool calls and tool schemas."""
+    texts = []
+    # Tool-call arguments as the SFT tokenizers render them: a JSON-escaped spelling reads as the token.
+    for message in _normalize_tool_call_arguments(row[sft_messages_key] or []):
+        if isinstance(message, Mapping):
+            if isinstance(message.get("reasoning_content"), str):
+                texts.append(message["reasoning_content"])
+            # JSON is a superset of what the template renders (it adds keys such as `id`), and no
+            # added token holds a character JSON escapes, so a literal survives `json.dumps`.
+            if message.get("tool_calls"):
+                texts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
+    # Tool schemas, decoded the same way.
+    tools = _normalize_tools_for_chat_template(row.get(TOOLS_COLUMN_KEY))
+    if tools:
+        texts.append(json.dumps(tools, ensure_ascii=False))
+    return texts
+
+
+def preference_tokenize_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer):
+    # Extract prompt (all messages except the last one)
+    prompt = row["chosen"][:-1]
+
+    # Tokenize prompt
+    row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, return_dict=False)
+    row[ATTENTION_MASK_PROMPT_KEY] = [1] * len(row[INPUT_IDS_PROMPT_KEY])
+
+    # Tokenize chosen completion
+    row[CHOSEN_INPUT_IDS_KEY] = tokenizer.apply_chat_template(row["chosen"], return_dict=False)
+    row[CHOSEN_ATTENTION_MASK_KEY] = [1] * len(row[CHOSEN_INPUT_IDS_KEY])
+
+    # Tokenize rejected completion
+    row[REJECTED_INPUT_IDS_KEY] = tokenizer.apply_chat_template(row["rejected"], return_dict=False)
+    row[REJECTED_ATTENTION_MASK_KEY] = [1] * len(row[REJECTED_INPUT_IDS_KEY])
+
+    return row
+
+
+def preference_filter_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_prompt_token_length: int | None = None,
+    max_token_length: int | None = None,
+):
+    # Check prompt length if specified
+    if max_prompt_token_length is not None and len(row[INPUT_IDS_PROMPT_KEY]) > max_prompt_token_length:
+        return False
+
+    # Check total sequence lengths if specified
+    if max_token_length is not None:
+        if len(row[CHOSEN_INPUT_IDS_KEY]) > max_token_length:
+            return False
+        if len(row[REJECTED_INPUT_IDS_KEY]) > max_token_length:
+            return False
+
+    return True
+
+
+def preference_tulu_tokenize_and_truncate_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    chosen_key: str = DEFAULT_CHOSEN_KEY,
+    rejected_key: str = DEFAULT_REJECTED_KEY,
+):
+    """
+    Here we assume each example has a rejected and chosen field, both of which are a list of messages.
+    Each message is a dict with 'role' and 'content' fields.
+    We assume only the last message is different, and the prompt is contained in the list of messages.
+    """
+    chosen_messages = row[chosen_key]
+    rejected_messages = row[rejected_key]
+    if len(chosen_messages) == 0:
+        raise ValueError("chosen messages field is empty.")
+    if len(rejected_messages) == 0:
+        raise ValueError("rejected messages field is empty.")
+
+    chosen_encoded = sft_tulu_tokenize_and_truncate_v1(
+        {DEFAULT_SFT_MESSAGES_KEY: chosen_messages}, tokenizer, max_seq_length
+    )
+    rejected_encoded = sft_tulu_tokenize_and_truncate_v1(
+        {DEFAULT_SFT_MESSAGES_KEY: rejected_messages}, tokenizer, max_seq_length
+    )
+
+    return {
+        CHOSEN_INPUT_IDS_KEY: chosen_encoded["input_ids"],
+        CHOSEN_LABELS_KEY: chosen_encoded["labels"],
+        CHOSEN_ATTENTION_MASK_KEY: chosen_encoded["attention_mask"],
+        REJECTED_INPUT_IDS_KEY: rejected_encoded["input_ids"],
+        REJECTED_LABELS_KEY: rejected_encoded["labels"],
+        REJECTED_ATTENTION_MASK_KEY: rejected_encoded["attention_mask"],
+    }
+
+
+def preference_tulu_tokenize_and_truncate_v1_2(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    chosen_key: str = DEFAULT_CHOSEN_KEY,
+    rejected_key: str = DEFAULT_REJECTED_KEY,
+):
+    """
+    Here we assume each example has a rejected and chosen field, both of which are a list of messages.
+    Each message is a dict with 'role' and 'content' fields.
+    We assume only the last message is different, and the prompt is contained in the list of messages.
+    """
+    chosen_messages = row[chosen_key]
+    rejected_messages = row[rejected_key]
+    if len(chosen_messages) == 0:
+        raise ValueError("chosen messages field is empty.")
+    if len(rejected_messages) == 0:
+        raise ValueError("rejected messages field is empty.")
+
+    chosen_encoded = last_turn_tulu_tokenize_and_truncate_v1(
+        {DEFAULT_SFT_MESSAGES_KEY: chosen_messages}, tokenizer, max_seq_length
+    )
+    rejected_encoded = last_turn_tulu_tokenize_and_truncate_v1(
+        {DEFAULT_SFT_MESSAGES_KEY: rejected_messages}, tokenizer, max_seq_length
+    )
+
+    return {
+        CHOSEN_INPUT_IDS_KEY: chosen_encoded["input_ids"],
+        CHOSEN_LABELS_KEY: chosen_encoded["labels"],
+        CHOSEN_ATTENTION_MASK_KEY: chosen_encoded["attention_mask"],
+        REJECTED_INPUT_IDS_KEY: rejected_encoded["input_ids"],
+        REJECTED_LABELS_KEY: rejected_encoded["labels"],
+        REJECTED_ATTENTION_MASK_KEY: rejected_encoded["attention_mask"],
+    }
+
+
+def preference_tulu_filter_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer):
+    return any(x != MASKED_TOKEN_VALUE for x in row[CHOSEN_LABELS_KEY]) and any(
+        x != MASKED_TOKEN_VALUE for x in row[REJECTED_LABELS_KEY]
+    )
+
+
+def rlvr_tokenize_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+    ground_truths_key: str = GROUND_TRUTHS_KEY,
+    verifier_source_key: str = VERIFIER_SOURCE_KEY,
+    system_prompt_override: str | None = None,
+    tool_definitions: list[dict[str, Any]] | None = None,
+    pass_tools_to_chat_template: bool = True,
+):
+    prompt = row[sft_messages_key] if len(row[sft_messages_key]) == 1 else row[sft_messages_key][:-1]
+
+    # Override the system prompt if provided
+    if system_prompt_override:
+        if prompt[0]["role"] == "system":
+            prompt = prompt[1:]
+        prompt = [{"role": "system", "content": system_prompt_override}] + prompt
+
+    tools_for_template: list[dict[str, Any]] | None = None
+    if pass_tools_to_chat_template and tool_definitions:
+        sample_active_tools = row.get(TOOLS_COLUMN_KEY)
+        if sample_active_tools is not None:
+            active_tool_names = set(sample_active_tools)
+            filtered_tools = [t for t in tool_definitions if t.get("function", {}).get("name") in active_tool_names]
+            if filtered_tools:
+                tools_for_template = filtered_tools
+        else:
+            tools_for_template = tool_definitions
+
+    row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(
+        prompt,
+        add_generation_prompt=True,
+        return_dict=False,
+        tools=tools_for_template,  # type: ignore[arg-type]
+    )
+    row[INPUT_IDS_KEY] = tokenizer.apply_chat_template(row[sft_messages_key], return_dict=False)
+    row[ATTENTION_MASK_KEY] = [1] * len(row[INPUT_IDS_KEY])
+    labels = copy.deepcopy(row[INPUT_IDS_KEY])
+    row[LABELS_KEY] = labels
+    row[GROUND_TRUTHS_KEY] = row[ground_truths_key]
+    row[VERIFIER_SOURCE_KEY] = row[verifier_source_key]
+    # concatenate all the previous messages as <role>: <content>\n <role>: <content>\n ...
+    row[RAW_PROMPT_KEY] = "\n".join(f"{msg['role']}: {msg['content']}" for msg in prompt)
+    return row
+
+
+def rlvr_tokenize_v2(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+    ground_truths_key: str = GROUND_TRUTHS_KEY,
+    verifier_source_key: str = VERIFIER_SOURCE_KEY,
+):
+    prompt = row[sft_messages_key] if len(row[sft_messages_key]) == 1 else row[sft_messages_key][:-1]
+    row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, return_dict=False)
+    row[INPUT_IDS_KEY] = tokenizer.apply_chat_template(row[sft_messages_key], return_dict=False)
+    # weird issue with qwen: sometimes the padding token ends up in the input ids?
+    # ill look into this more later, for now this guard should be enough
+    if tokenizer.pad_token_id in row[INPUT_IDS_KEY]:
+        row[INPUT_IDS_KEY] = [x for x in row[INPUT_IDS_KEY] if x != tokenizer.pad_token_id]
+    if tokenizer.pad_token_id in row[INPUT_IDS_PROMPT_KEY]:
+        row[INPUT_IDS_PROMPT_KEY] = [x for x in row[INPUT_IDS_PROMPT_KEY] if x != tokenizer.pad_token_id]
+    row[ATTENTION_MASK_KEY] = [1] * len(row[INPUT_IDS_KEY])
+    labels = copy.deepcopy(row[INPUT_IDS_KEY])
+    row[LABELS_KEY] = labels
+
+    # Get the raw values from the source keys
+    ground_truths_val = row[ground_truths_key]
+    verifier_source_val = row[verifier_source_key]
+
+    # if the verifier source is a string, we wrap it in a list (compatibility with multi-verifier datasets)
+    # we also then wrap ground truths in a list to match.
+    if isinstance(verifier_source_val, str):
+        verifier_source_val = [verifier_source_val]
+        ground_truths_val = [ground_truths_val]
+    row[GROUND_TRUTHS_KEY] = ground_truths_val
+    row[VERIFIER_SOURCE_KEY] = verifier_source_val
+
+    # concatenate all the previous messages as <role>: <content>\n <role>: <content>\n ...
+    row[RAW_PROMPT_KEY] = "\n".join(f"{msg['role']}: {msg['content']}" for msg in prompt)
+    # drop the messages field as it often causes issues.
+    row.pop(sft_messages_key)
+    return row
+
+
+def _resolve_tools_for_sample(
+    row: dict[str, Any], tool_definitions: list[dict[str, Any]] | None, pass_tools: bool
+) -> list[dict[str, Any]] | None:
+    """Resolve which tool definitions to inject into this sample's prompt.
+
+    Filters global tool_definitions by per-sample active_tools column.
+    """
+    if not pass_tools or not tool_definitions:
+        return None
+
+    sample_active_tools = row.get(TOOLS_COLUMN_KEY)
+    if sample_active_tools is not None:
+        known_names = {t.get("function", {}).get("name") for t in tool_definitions}
+        unknown = set(sample_active_tools) - known_names
+        if unknown:
+            logger.warning(f"Sample references unknown tools: {sorted(unknown)}. Known: {sorted(known_names)}")
+        filtered = [t for t in tool_definitions if t.get("function", {}).get("name") in sample_active_tools]
+        return filtered or None
+    return tool_definitions
+
+
+def rlvr_tokenize_v3(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+    ground_truths_key: str = GROUND_TRUTHS_KEY,
+    verifier_source_key: str = VERIFIER_SOURCE_KEY,
+    system_prompt_override: str | None = None,
+    tool_definitions: list[dict[str, Any]] | None = None,
+    pass_tools_to_chat_template: bool = True,
+):
+    prompt = row.pop(sft_messages_key)
+    assert len(prompt) > 0, "Empty prompt in dataset"
+    # if the prompt has multiple messages, make sure we don't end in an assistant message.
+    if len(prompt) > 1 and prompt[-1]["role"] == "assistant":
+        prompt = prompt[:-1]
+    # override the system prompt if we have a new one provided.
+    if system_prompt_override:
+        if prompt[0]["role"] == "system":
+            del prompt[0]
+        prompt = [{"role": "system", "content": system_prompt_override}] + prompt
+
+    tools_for_template = _resolve_tools_for_sample(row, tool_definitions, pass_tools_to_chat_template)
+
+    row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(
+        prompt,
+        add_generation_prompt=True,
+        return_dict=False,
+        tools=tools_for_template,  # type: ignore[arg-type]
+    )
+    if tokenizer.pad_token_id in row[INPUT_IDS_PROMPT_KEY]:
+        row[INPUT_IDS_PROMPT_KEY] = [x for x in row[INPUT_IDS_PROMPT_KEY] if x != tokenizer.pad_token_id]
+    # Get the raw values from the source keys
+    ground_truths_val = row[ground_truths_key]
+    verifier_source_val = row[verifier_source_key]
+
+    # Get the raw values from the source keys
+    ground_truths_val = row[ground_truths_key]
+    verifier_source_val = row[verifier_source_key]
+
+    # if the verifier source is a string, we wrap it in a list (compatibility with multi-verifier datasets)
+    # we also then wrap ground truths in a list to match.
+    if isinstance(verifier_source_val, str):
+        verifier_source_val = [verifier_source_val]
+        ground_truths_val = [ground_truths_val]
+    row[GROUND_TRUTHS_KEY] = ground_truths_val
+    row[VERIFIER_SOURCE_KEY] = verifier_source_val
+
+    # concatenate all the previous messages as <role>: <content>\n <role>: <content>\n ...
+    row[RAW_PROMPT_KEY] = "\n".join(f"{msg['role']}: {msg['content']}" for msg in prompt)
+    return row
+
+
+def rlvr_filter_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    need_contain_labels: bool = True,
+    max_prompt_token_length: int | None = None,
+    max_token_length: int | None = None,
+):
+    max_prompt_token_length_ok = True
+    if max_prompt_token_length is not None:
+        max_prompt_token_length_ok = len(row[INPUT_IDS_PROMPT_KEY]) <= max_prompt_token_length
+
+    max_token_length_ok = True
+    if max_token_length is not None:
+        max_token_length_ok = len(row[INPUT_IDS_KEY]) <= max_token_length
+
+    contain_some_labels = any(x != MASKED_TOKEN_VALUE for x in row[LABELS_KEY])
+    return max_prompt_token_length_ok and max_token_length_ok and (contain_some_labels or not need_contain_labels)
+
+
+def rlvr_max_length_filter_v2(
+    row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_prompt_token_length: int | None = None
+):
+    if max_prompt_token_length is None:
+        return True
+    return len(row[INPUT_IDS_PROMPT_KEY]) <= max_prompt_token_length
+
+
+TRANSFORM_FNS = {
+    "sft_tokenize_v1": (sft_tokenize_v1, "map"),
+    "sft_tokenize_mask_out_prompt_v1": (sft_tokenize_mask_out_prompt_v1, "map"),
+    "sft_filter_v1": (sft_filter_v1, "filter"),
+    "sft_tulu_tokenize_without_truncation_v1": (sft_tulu_tokenize_without_truncation_v1, "map"),
+    "sft_tulu_tokenize_and_truncate_v1": (sft_tulu_tokenize_and_truncate_v1, "map"),
+    "sft_tulu_filter_v1": (sft_tulu_filter_v1, "filter"),
+    "sft_added_token_strings_filter_v2": (sft_added_token_strings_filter_v2, "filter"),
+    "last_turn_tulu_tokenize_and_truncate_v1": (last_turn_tulu_tokenize_and_truncate_v1, "map"),
+    "preference_tokenize_v1": (preference_tokenize_v1, "map"),
+    "preference_filter_v1": (preference_filter_v1, "filter"),
+    "preference_tulu_tokenize_and_truncate_v1": (preference_tulu_tokenize_and_truncate_v1_2, "map"),
+    "preference_tulu_filter_v1": (preference_tulu_filter_v1, "filter"),
+    "rlvr_tokenize_v1": (rlvr_tokenize_v3, "map"),
+    "rlvr_max_length_filter_v1": (rlvr_max_length_filter_v2, "filter"),
+}
+
+# SFT tokenization functions that consume the tools column — don't re-add it to target_columns.
+# Only list functions that actually forward `tools` to the chat template: for a function that
+# ignores the column, dropping it here would silently discard the tool schemas instead of
+# rendering them. `sft_tokenize_v1` / `sft_tokenize_mask_out_prompt_v1` do not support tools,
+# so they keep the column (as before tool support was added).
+_SFT_TOKENIZE_FNS = {
+    "sft_tulu_tokenize_without_truncation_v1",
+    "sft_tulu_tokenize_and_truncate_v1",
+    "last_turn_tulu_tokenize_and_truncate_v1",
+}
+
+
+class SimplePreferenceCollator:
+    def __init__(self, pad_token_id: int):
+        """Simple collator for preference dataset (always pad from the RIGHT)"""
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, batch: list[dict[str, list[int]]]):
+        """the input will have input_ids_chosen, input_ids_rejected"""
+        # Find max length in the batch
+        max_length_chosen = -1
+        max_length_rejected = -1
+        for i in range(len(batch)):
+            max_length_chosen = max(max_length_chosen, len(batch[i][CHOSEN_INPUT_IDS_KEY]))
+            max_length_rejected = max(max_length_rejected, len(batch[i][REJECTED_INPUT_IDS_KEY]))
+        max_length = max(max_length_chosen, max_length_rejected)
+        assert max_length > 0, "the dataset is empty"
+
+        # Initialize lists to store padded sequences and attention masks
+        padded_sequences_chosen = []
+        padded_sequences_rejected = []
+
+        for i in range(len(batch)):
+            # Calculate padding length
+            pad_length_chosen = max_length - len(batch[i][CHOSEN_INPUT_IDS_KEY])
+            pad_length_rejected = max_length - len(batch[i][REJECTED_INPUT_IDS_KEY])
+
+            # Pad from the right
+            padding_chosen = [self.pad_token_id] * pad_length_chosen
+            padding_rejected = [self.pad_token_id] * pad_length_rejected
+            padded_sequence_chosen = batch[i][CHOSEN_INPUT_IDS_KEY] + padding_chosen
+            padded_sequence_rejected = batch[i][REJECTED_INPUT_IDS_KEY] + padding_rejected
+            padded_sequences_chosen.append(padded_sequence_chosen)
+            padded_sequences_rejected.append(padded_sequence_rejected)
+
+        # Convert to tensors
+        padded_sequences_chosen = torch.tensor(padded_sequences_chosen)
+        padded_sequences_rejected = torch.tensor(padded_sequences_rejected)
+
+        return {CHOSEN_INPUT_IDS_KEY: padded_sequences_chosen, REJECTED_INPUT_IDS_KEY: padded_sequences_rejected}
+
+
+# ----------------------------------------------------------------------------
+# Dataset Configuration and Caching
+@dataclass
+class DatasetConfig:
+    dataset_name: str
+    dataset_split: str
+    dataset_revision: str
+    dataset_range: int | None = None
+    transform_fn: list[str] = field(default_factory=list)
+    transform_fn_args: list[dict[str, Any]] = field(default_factory=list)
+    target_columns: list[str] | None = None
+    dataset_config_seed: int = 42
+
+    # for tracking purposes
+    dataset_commit_hash: str | None = None
+    frac_or_num_samples: int | float | None = None
+    original_dataset_size: int | None = None
+    is_upsampled: bool = False
+    dataset: Dataset = field(init=False)
+
+    def __post_init__(self):
+        # if the file exists locally, use the local file
+        if os.path.exists(self.dataset_name) and self.dataset_name.endswith(".jsonl"):
+            assert self.dataset_split == "train", "Only train split is supported for local jsonl files."
+            dataset = load_dataset(
+                "json", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes()
+            )
+        elif os.path.exists(self.dataset_name) and self.dataset_name.endswith(".parquet"):
+            assert self.dataset_split == "train", "Only train split is supported for local parquet files."
+            dataset = load_dataset(
+                "parquet", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes()
+            )
+        else:
+            dataset = load_dataset(
+                self.dataset_name,
+                split=self.dataset_split,
+                revision=self.dataset_revision,
+                num_proc=max_num_processes(),
+            )
+            # Commit hash only works for hf datasets. Resolve it only after
+            # load_dataset: the lookup is cache-only, so on a fresh machine it
+            # returns None until the download has populated the HF hub cache.
+            self.dataset_commit_hash = get_commit_hash(
+                self.dataset_name, self.dataset_revision, "README.md", "dataset"
+            )
+        assert isinstance(dataset, Dataset), f"Expected Dataset, got {type(dataset)}"
+        self.dataset = dataset
+        if self.dataset_range is None:
+            dataset_range = len(self.dataset)
+            self.update_range(dataset_range)
+
+    def update_range(self, dataset_range: int):
+        self.dataset_range = dataset_range
+        original_size = len(self.dataset)
+        self.original_dataset_size = original_size
+
+        self.dataset = self.select_samples(self.dataset_range)
+        self.is_upsampled = dataset_range > original_size
+
+    def select_samples(self, target_size: int):
+        """Upsample dataset to target_size by repeating samples."""
+        original_size = len(self.dataset)
+
+        # Calculate how many full repeats and how many extra samples
+        full_repeats = target_size // original_size
+        extra_samples = target_size % original_size
+
+        # Create indices for upsampling
+        indices = []
+
+        # Add full repeats
+        for _ in range(full_repeats):
+            indices.extend(range(original_size))
+
+        # Add randomly sampled extra samples
+        if extra_samples > 0:
+            # Use numpy for reproducible random sampling
+            rng = np.random.RandomState(self.dataset_config_seed)
+            extra_indices = rng.choice(original_size, size=extra_samples, replace=False)
+            indices.extend(extra_indices.tolist())
+
+        if target_size > original_size:
+            print(
+                f"Upsampling dataset {self.dataset_name} from {original_size} to {target_size} samples "
+                f"({full_repeats} full repeats + {extra_samples} random samples)"
+            )
+
+        return self.dataset.select(indices)
+
+
+def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
+    assert len(dc.transform_fn) == len(dc.transform_fn_args), (
+        f"transform_fn and transform_fn_args must have the same length: {dc.transform_fn=} != {dc.transform_fn_args=}"
+    )
+    # beaker specific logic; we may get assigned 15.5 CPU, so we convert it to float then int
+    num_proc = int(float(os.environ.get("BEAKER_ASSIGNED_CPU_COUNT", multiprocessing.cpu_count())))
+
+    tokenizer = tc.tokenizer
+    dataset = dc.dataset
+    chat_template = getattr(tokenizer, "chat_template", None)
+    try:
+        chat_template_str = json.dumps(chat_template, sort_keys=True)
+    except TypeError:
+        chat_template_str = str(chat_template)
+    chat_template_hash = hashlib.sha256(chat_template_str.encode()).hexdigest()[:16]
+    tokenizer_files_hash = json.dumps(tc.tokenizer_files_hash, sort_keys=True)
+
+    # Add dataset source field to track origin after shuffling
+    dataset = dataset.map(
+        lambda example: {**example, DATASET_ORIGIN_KEY: dc.dataset_name},
+        num_proc=num_proc,
+        desc=f"Adding dataset source field for {dc.dataset_name}",
+    )
+
+    # Normalize env_config before tokenization so downstream always sees canonical payloads.
+    if ENV_CONFIG_KEY in dataset.column_names:
+        env_config_fingerprint = hashlib.sha256(
+            f"{DATASET_CACHE_VERSION}:normalize_env_config:{dataset._fingerprint}".encode()
+        ).hexdigest()[:16]
+        dataset = dataset.map(
+            _normalize_env_config_row,
+            num_proc=get_num_proc(len(dataset), num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU),
+            new_fingerprint=env_config_fingerprint,
+            desc=f"Normalizing {ENV_CONFIG_KEY} for {dc.dataset_name}",
+        )
+
+    tc_dict = {k: v for k, v in asdict(tc).items() if v is not None}
+    tc_json = json.dumps(tc_dict, sort_keys=True)
+    for fn_name, fn_args in zip(dc.transform_fn, dc.transform_fn_args):
+        fn, fn_type = TRANSFORM_FNS[fn_name]
+        # always pass in tokenizer and other args if needed
+        fn_kwargs = {"tokenizer": tokenizer}
+        fn_kwargs.update(fn_args)
+
+        # Compute a custom fingerprint that includes DATASET_CACHE_VERSION to invalidate
+        # HuggingFace's internal .map() cache when transformation logic changes significantly
+        new_fingerprint = hashlib.sha256(
+            (
+                f"{DATASET_CACHE_VERSION}:{fn_name}:{dataset._fingerprint}:{json.dumps(fn_args, sort_keys=True)}:{tc_json}"
+                f"{tc.chat_template_name}:{tc.get_tokenizer_fn}:{tokenizer_files_hash}:{chat_template_hash}"
+            ).encode()
+        ).hexdigest()[:16]
+
+        # perform the transformation
+        target_columns = dataset.column_names if dc.target_columns is None else dc.target_columns
+        # Always preserve dataset_source if it exists
+        target_columns = _preserve_column(DATASET_ORIGIN_KEY, dataset, target_columns)
+        # SFT tokenization consumes the tools column and must not persist it; other transforms keep it.
+        if fn_name not in _SFT_TOKENIZE_FNS:
+            target_columns = _preserve_column(TOOLS_COLUMN_KEY, dataset, target_columns)
+        else:
+            target_columns = [col for col in target_columns if col != TOOLS_COLUMN_KEY]
+        target_columns = _preserve_column(ENV_CONFIG_KEY, dataset, target_columns)
+
+        if fn_type == "map":
+            dataset = dataset.map(
+                fn,
+                fn_kwargs=fn_kwargs,
+                remove_columns=[col for col in dataset.column_names if col not in target_columns],
+                num_proc=get_num_proc(len(dataset), num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU),
+                new_fingerprint=new_fingerprint,
+            )
+        elif fn_type == "filter":
+            num_rows_before = len(dataset)
+            dataset = dataset.filter(
+                fn,
+                fn_kwargs=fn_kwargs,
+                num_proc=get_num_proc(len(dataset), num_proc, FILTER_EXAMPLE_PER_SECOND_PER_CPU),
+                new_fingerprint=new_fingerprint,
+            )
+            num_removed = num_rows_before - len(dataset)
+            logger.info(
+                f"{fn_name} filtered out {num_removed} of {num_rows_before} rows "
+                f"({100 * num_removed / max(num_rows_before, 1):.4f}%) from {dc.dataset_name}"
+            )
+        # NOTE: elif we can implement packing here to create a packed SFT dataset. Low priority for now.
+        else:
+            raise ValueError(f"Unknown transform function type: {fn_type}")
+
+    if len(dataset) == 0:
+        raise ValueError("No examples left after transformation")
+    return dataset
+
+
+def _get_serializable_dataset_config_dict(dc: DatasetConfig, exclude_none: bool = False) -> dict:
+    """Convert DatasetConfig to a JSON-serializable dict.
+
+    Args:
+        dc: The DatasetConfig to convert.
+        exclude_none: If True, exclude keys with None values (useful for hashing).
+
+    Returns:
+        A dictionary representation of the DatasetConfig, excluding the non-serializable
+        'dataset' field.
+    """
+    d = asdict(dc)
+    d.pop("dataset", None)
+    if exclude_none:
+        d = {k: v for k, v in d.items() if v is not None}
+    return d
+
+
+def _get_chat_template_metadata(tc: TokenizerConfig) -> dict[str, str | None]:
+    name = tc.chat_template_name
+    template = getattr(tc.tokenizer, "chat_template", None)
+    try:
+        template_str = json.dumps(template, sort_keys=True)
+    except TypeError:
+        template_str = str(template)
+    source = (
+        f"tokenizer:{tc.tokenizer_name_or_path}" if name is None or name == "tokenizer_default" else f"registry:{name}"
+    )
+    return {
+        "chat_template_name": name,
+        "chat_template_source": source,
+        "chat_template_hash": hashlib.sha256(template_str.encode()).hexdigest(),
+    }
+
+
+def compute_config_hash(dcs: list[DatasetConfig], tc: TokenizerConfig) -> str:
+    """Compute a deterministic hash of both configs for caching.
+
+    The hash includes DATASET_CACHE_VERSION to invalidate old caches when
+    transformation logic changes significantly.
+    """
+    # Resolve the tokenizer before snapshotting tc: loading it populates
+    # tc.tokenizer_files_hash, so hashing a pristine tc would give a different
+    # result than hashing the same tc after any tc.tokenizer access.
+    chat_template = getattr(tc.tokenizer, "chat_template", None)
+    dc_dicts = [_get_serializable_dataset_config_dict(dc, exclude_none=True) for dc in dcs]
+    tc_dict = {k: v for k, v in asdict(tc).items() if v is not None}
+    try:
+        chat_template_str = json.dumps(chat_template, sort_keys=True)
+    except TypeError:
+        chat_template_str = str(chat_template)
+    chat_template_hash = hashlib.sha256(chat_template_str.encode()).hexdigest()
+    combined_dict = {
+        "cache_version": DATASET_CACHE_VERSION,
+        "dataset_configs": dc_dicts,
+        "tokenizer_config": tc_dict,
+        "chat_template_hash": chat_template_hash,
+    }
+    config_str = json.dumps(combined_dict, sort_keys=True)
+    return hashlib.sha256(config_str.encode()).hexdigest()[:10]
+
+
+class DatasetTransformationCache:
+    def __init__(self, config_hash: str, hf_entity: str | None = None):
+        self.config_hash = config_hash
+        self.hf_entity = hf_entity or hf_whoami()["name"]
+
+    def load_or_transform_dataset(
+        self, dcs: list[DatasetConfig], tc: TokenizerConfig, dataset_skip_cache: bool = False
+    ) -> tuple[Dataset, dict[str, Any]]:
+        """Load dataset from cache if it exists, otherwise transform and cache it."""
+        repo_name = f"{self.hf_entity}/dataset-mix-cached"
+
+        # NOTE: the cached dataset is always train split
+        DEFAULT_SPLIT_FOR_CACHED_DATASET = "train"
+
+        # Check if the revision exists
+        if revision_exists(repo_name, self.config_hash, repo_type="dataset"):
+            print(f"✅ Found cached dataset at https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
+            if dataset_skip_cache:
+                print("dataset_skip_cache is True, so we will not load the dataset from cache")
+            else:
+                # Use the split from the first dataset config as default
+                loaded_dataset = load_dataset(
+                    repo_name,
+                    split=DEFAULT_SPLIT_FOR_CACHED_DATASET,
+                    revision=self.config_hash,
+                    num_proc=max_num_processes(),
+                )
+                assert isinstance(loaded_dataset, Dataset)
+                if "index" not in loaded_dataset.column_names:
+                    loaded_dataset = loaded_dataset.add_column("index", range(len(loaded_dataset)))
+                return loaded_dataset, EMPTY_DATASET_STATISTICS.copy()
+
+        print("Cache not found, transforming datasets...")
+
+        # Transform each dataset
+        transformed_datasets = []
+        for dc in dcs:
+            dataset = get_dataset_v1(dc, tc)
+            transformed_datasets.append(dataset)
+
+        # Combine datasets
+        combined_dataset = concatenate_datasets(transformed_datasets)
+        if "index" in combined_dataset.column_names:
+            combined_dataset = combined_dataset.remove_columns("index")
+        combined_dataset = combined_dataset.add_column("index", range(len(combined_dataset)))
+        if dataset_skip_cache:
+            return combined_dataset, EMPTY_DATASET_STATISTICS.copy()
+
+        # Push to hub with config hash as revision
+        combined_dataset.push_to_hub(
+            repo_name,
+            private=True,
+            revision=self.config_hash,
+            commit_message=f"Cache combined dataset with configs hash: {self.config_hash}",
+        )
+        print(f"🚀 Pushed transformed dataset to https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
+
+        model_card = ModelCard(
+            f"""\
+---
+tags: [open-instruct]
+---
+
+# Cached Tokenized Datasets
+
+## Summary
+
+This is a cached dataset produced by https://github.com/allenai/open-instruct
+
+## Configuration
+
+`TokenizerConfig`:
+```json
+{json.dumps(asdict(tc), indent=2)}
+```
+
+`List[DatasetConfig]`:
+```json
+{json.dumps([_get_serializable_dataset_config_dict(dc) for dc in dcs], indent=2)}
+```
+"""
+        )
+        model_card.push_to_hub(repo_name, repo_type="dataset", revision=self.config_hash)
+
+        # NOTE: Load the dataset again to make sure it's downloaded to the HF cache
+        print(f"✅ Found cached dataset at https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
+        final_dataset = load_dataset(
+            repo_name, split=DEFAULT_SPLIT_FOR_CACHED_DATASET, revision=self.config_hash, num_proc=max_num_processes()
+        )
+        assert isinstance(final_dataset, Dataset)
+        return final_dataset, EMPTY_DATASET_STATISTICS.copy()
+
+
+class LocalDatasetTransformationCache:
+    def __init__(self, config_hash: str, dataset_local_cache_dir: str):
+        """Initialize the local cache with a directory path."""
+        self.config_hash = config_hash
+        self.dataset_local_cache_dir = dataset_local_cache_dir
+        os.makedirs(dataset_local_cache_dir, exist_ok=True)
+
+    def get_cache_path(self) -> str:
+        """Get the path to the cached dataset."""
+        return os.path.join(self.dataset_local_cache_dir, self.config_hash)
+
+    def save_config(self, config_hash: str, dcs: list[DatasetConfig], tc: TokenizerConfig):
+        """Save the configuration to a JSON file."""
+        config_path = os.path.join(self.get_cache_path(), "config.json")
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+        # Filter out `dataset` field because HuggingFace Dataset objects are not JSON serializable
+        config_dict = {
+            "tokenizer_config": asdict(tc),
+            "dataset_configs": [_get_serializable_dataset_config_dict(dc) for dc in dcs],
+            "config_hash": config_hash,
+        }
+        with open(config_path, "w") as f:
+            json.dump(config_dict, f, indent=2)
+
+    def load_or_transform_dataset(
+        self, dcs: list[DatasetConfig], tc: TokenizerConfig, dataset_skip_cache: bool = False
+    ) -> tuple[Dataset, dict[str, Any]]:
+        """Load dataset from local cache if it exists, otherwise transform and cache it locally."""
+        cache_path = self.get_cache_path()
+
+        # Check if the cache exists
+        if os.path.exists(cache_path) and not dataset_skip_cache:
+            print(f"✅ Found cached dataset at {cache_path}")
+            dataset = Dataset.load_from_disk(cache_path, keep_in_memory=True)
+            if "index" not in dataset.column_names:
+                dataset = dataset.add_column("index", range(len(dataset)))
+            # Load statistics from cache if available
+            stats_path = os.path.join(cache_path, "dataset_statistics.json")
+            if os.path.exists(stats_path):
+                with open(stats_path) as f:
+                    statistics = json.load(f)
+                for key in ("chat_template_name", "chat_template_source", "chat_template_hash"):
+                    if key not in statistics:
+                        statistics[key] = None
+                return dataset, statistics
+            else:
+                # Return empty statistics if not cached
+                return dataset, EMPTY_DATASET_STATISTICS.copy()
+
+        print("Cache not found or invalid, transforming datasets...")
+
+        # Transform each dataset and collect statistics
+        transformed_datasets = []
+        dataset_statistics = []
+        dataset_order = []
+
+        for dc in dcs:
+            # Get initial dataset info
+            initial_size = len(dc.dataset) if dc.dataset else 0
+
+            dataset = get_dataset_v1(dc, tc)
+            transformed_datasets.append(dataset)
+
+            # Collect statistics for this dataset
+            stats = {
+                "dataset_name": dc.dataset_name,
+                "dataset_split": dc.dataset_split,
+                "initial_instances": initial_size,
+                "final_instances": len(dataset),
+                "instances_filtered": initial_size - len(dataset),
+                "frac_or_num_samples": dc.frac_or_num_samples,
+                "original_dataset_size": dc.original_dataset_size,
+                "is_upsampled": dc.is_upsampled,
+                "upsampling_factor": dc.dataset_range / dc.original_dataset_size
+                if dc.dataset_range is not None and dc.original_dataset_size and dc.original_dataset_size > 0
+                else 1.0,
+            }
+
+            # Count tokens if the dataset has been tokenized
+            if INPUT_IDS_KEY in dataset.column_names:
+                total_tokens, trainable_tokens = token_statistics.count_tokens(
+                    dataset, INPUT_IDS_KEY, LABELS_KEY, MASKED_TOKEN_VALUE
+                )
+                stats["total_tokens"] = total_tokens
+                stats["trainable_tokens"] = trainable_tokens
+                stats["avg_tokens_per_instance"] = total_tokens / len(dataset) if len(dataset) > 0 else 0
+
+            dataset_statistics.append(stats)
+            dataset_order.append(dc.dataset_name)
+
+        # Combine datasets
+        combined_dataset = concatenate_datasets(transformed_datasets)
+        if "index" in combined_dataset.column_names:
+            combined_dataset = combined_dataset.remove_columns("index")
+        combined_dataset = combined_dataset.add_column("index", range(len(combined_dataset)))
+
+        all_statistics = {
+            "per_dataset_stats": dataset_statistics,
+            "dataset_order": dataset_order,
+            **_get_chat_template_metadata(tc),
+        }
+
+        if dataset_skip_cache:
+            return combined_dataset, all_statistics
+
+        # Save to local cache
+        combined_dataset.save_to_disk(cache_path)
+        self.save_config(self.config_hash, dcs, tc)
+
+        # Save statistics to cache
+        stats_path = os.path.join(cache_path, "dataset_statistics.json")
+        with open(stats_path, "w") as f:
+            json.dump(all_statistics, f, indent=2)
+
+        print(f"🚀 Saved transformed dataset to {cache_path}")
+        print(f"✅ Found cached dataset at {cache_path}")
+
+        loaded_dataset = Dataset.load_from_disk(cache_path, keep_in_memory=True)
+        return loaded_dataset, all_statistics
+
+
+def load_dataset_configs(
+    dataset_mixer_list: list[str],
+    dataset_mixer_list_splits: list[str],
+    dataset_transform_fn: list[str],
+    transform_fn_args: list[dict[str, Any]],
+    target_columns: list[str] | None = None,
+    dataset_config_seed: int = 42,
+) -> list[DatasetConfig]:
+    """
+    Load and configure datasets from a mixer list.
+
+    Args:
+        dataset_mixer_list: Alternating list of [dataset_name, amount, dataset_name, amount, ...].
+            The 'amount' value determines how many samples to use:
+
+            - Float values (must contain a decimal point): Interpreted as a PROPORTION of the dataset.
+              Examples: "1.0" = 100% of dataset, "0.5" = 50%, "3.0" = 300% (3x upsampling)
+
+            - Integer values (no decimal point): Interpreted as an absolute SAMPLE COUNT.
+              Examples: "100" = exactly 100 samples, "1000" = exactly 1000 samples
+
+            IMPORTANT: "1" means 1 sample, NOT 100% of the dataset. Use "1.0" for 100%.
+            This is a common source of errors - always use decimal notation for proportions.
+
+        dataset_mixer_list_splits: Split names for each dataset (e.g., ["train"]).
+            If a single split is provided, it's used for all datasets.
+        dataset_transform_fn: Transform function names to apply.
+        transform_fn_args: Arguments for transform functions.
+        target_columns: Optional list of columns to keep.
+        dataset_config_seed: Random seed for sampling.
+
+    Returns:
+        List of configured DatasetConfig objects.
+    """
+    dcs = []
+    if len(dataset_mixer_list_splits) == 1:
+        print("by default, we will use the same split for all datasets")
+        dataset_mixer_list_splits = [dataset_mixer_list_splits[0]] * (len(dataset_mixer_list) // 2)
+    else:
+        if len(dataset_mixer_list_splits) != len(dataset_mixer_list) // 2:
+            raise ValueError(
+                f"dataset_mixer_list_splits length must be half of dataset_mixer_list (since mixer list alternates [dataset, amount]): {len(dataset_mixer_list_splits)=} != {len(dataset_mixer_list)//2=}"
+            )
+    assert len(dataset_mixer_list) % 2 == 0, f"Data mixer list length is not even: {dataset_mixer_list}"
+    for i in range(0, len(dataset_mixer_list), 2):
+        dataset_name = dataset_mixer_list[i]
+        frac_or_num_samples = dataset_mixer_list[i + 1]
+        # Parse amount: strings with "." become floats (proportions), without become ints (counts).
+        # IMPORTANT: "1" = 1 sample, "1.0" = 100% of dataset. This is a common mistake!
+        frac_or_num_samples = float(frac_or_num_samples) if "." in frac_or_num_samples else int(frac_or_num_samples)
+        assert i % 2 == 0, f"Index {i} must be even"
+        assert (i // 2) < len(dataset_mixer_list_splits), (
+            f"Index {i // 2} out of bounds for dataset_mixer_list_splits of length {len(dataset_mixer_list_splits)}"
+        )
+        dataset_config = DatasetConfig(
+            dataset_name=dataset_name,
+            dataset_split=dataset_mixer_list_splits[i // 2],
+            dataset_revision="main",
+            transform_fn=dataset_transform_fn,
+            transform_fn_args=transform_fn_args,
+            target_columns=target_columns,
+            frac_or_num_samples=frac_or_num_samples,
+            dataset_config_seed=dataset_config_seed,
+        )
+
+        original_size = len(dataset_config.dataset)
+        if isinstance(frac_or_num_samples, int) and frac_or_num_samples > original_size:
+            new_range = frac_or_num_samples
+        elif isinstance(frac_or_num_samples, float):
+            new_range = int(frac_or_num_samples * original_size)
+        else:
+            new_range = int(frac_or_num_samples)
+
+        print(f"Dataset {dataset_name}: {original_size} -> {new_range} samples (factor: {frac_or_num_samples})")
+
+        # Warn if using a suspiciously small integer count - likely a typo (meant "1.0" not "1")
+        if isinstance(frac_or_num_samples, int) and frac_or_num_samples <= 10 and original_size > 100:
+            logger.warning(
+                f"Dataset '{dataset_name}': Using only {frac_or_num_samples} sample(s) from {original_size} available. "
+                f"Did you mean '{float(frac_or_num_samples)}' for {frac_or_num_samples * 100}% of the dataset? "
+                f"Integer values (no decimal) = sample count, float values (with decimal) = proportion."
+            )
+
+        dataset_config.update_range(new_range)
+        dcs.append(dataset_config)
+    return dcs
+
+
+def get_cached_dataset_tulu_with_statistics(
+    dataset_mixer_list: list[str],
+    dataset_mixer_list_splits: list[str],
+    tc: TokenizerConfig,
+    dataset_transform_fn: list[str],
+    transform_fn_args: list[dict[str, Any]],
+    target_columns: list[str] | None = None,
+    dataset_cache_mode: Literal["hf", "local"] = "local",
+    dataset_config_hash: str | None = None,
+    hf_entity: str | None = None,
+    dataset_local_cache_dir: str = "local_dataset_cache",
+    dataset_skip_cache: bool = False,
+    drop_dataset_source: bool = True,
+    dataset_config_seed: int = 42,
+    system_prompt_override: str | None = None,
+) -> tuple[Dataset, dict[str, Any]]:
+    if dataset_config_hash is None:
+        dcs = load_dataset_configs(
+            dataset_mixer_list,
+            dataset_mixer_list_splits,
+            dataset_transform_fn,
+            transform_fn_args,
+            target_columns,
+            dataset_config_seed,
+        )
+        dataset_config_hash = compute_config_hash(dcs, tc)
+    else:
+        dcs = []
+    if dataset_cache_mode == "local":
+        cache = LocalDatasetTransformationCache(
+            config_hash=dataset_config_hash, dataset_local_cache_dir=dataset_local_cache_dir
+        )
+    elif dataset_cache_mode == "hf":
+        cache = DatasetTransformationCache(config_hash=dataset_config_hash, hf_entity=hf_entity)
+
+    dataset, statistics = cache.load_or_transform_dataset(dcs, tc, dataset_skip_cache=dataset_skip_cache)
+
+    if drop_dataset_source:
+        dataset = remove_dataset_source_field(dataset)
+
+    return dataset, statistics
+
+
+def get_cached_dataset_tulu(
+    dataset_mixer_list: list[str],
+    dataset_mixer_list_splits: list[str],
+    tc: TokenizerConfig,
+    dataset_transform_fn: list[str],
+    transform_fn_args: list[dict[str, Any]],
+    target_columns: list[str] | None = None,
+    dataset_cache_mode: Literal["hf", "local"] = "local",
+    dataset_config_hash: str | None = None,
+    hf_entity: str | None = None,
+    dataset_local_cache_dir: str = "local_dataset_cache",
+    dataset_skip_cache: bool = False,
+    dataset_config_seed: int = 42,
+    system_prompt_override: str | None = None,
+) -> Dataset:
+    return get_cached_dataset_tulu_with_statistics(
+        dataset_mixer_list=dataset_mixer_list,
+        dataset_mixer_list_splits=dataset_mixer_list_splits,
+        tc=tc,
+        dataset_transform_fn=dataset_transform_fn,
+        transform_fn_args=transform_fn_args,
+        target_columns=target_columns,
+        dataset_cache_mode=dataset_cache_mode,
+        dataset_config_hash=dataset_config_hash,
+        hf_entity=hf_entity,
+        dataset_local_cache_dir=dataset_local_cache_dir,
+        dataset_skip_cache=dataset_skip_cache,
+        drop_dataset_source=True,
+        dataset_config_seed=dataset_config_seed,
+        system_prompt_override=system_prompt_override,
+    )[0]

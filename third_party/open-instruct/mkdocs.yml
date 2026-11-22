@@ -1,0 +1,146 @@
+site_name: Open Instruct
+site_url: https://github.com/allenai/open-instruct
+theme:
+  favicon: assets/favicon.ico
+  name: material
+  features:
+    # - navigation.instant
+    - navigation.tracking
+    # - navigation.tabs
+    # - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: ai2-dark
+      primary: custom
+      toggle:
+        icon: material/lightbulb
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: ai2
+      primary: custom
+      toggle:
+        icon: material/lightbulb-outline
+        name: Switch to dark mode
+#adding git repo
+repo_url: https://github.com/allenai/open-instruct
+repo_name: allenai/open-instruct
+#markdown_extensions
+markdown_extensions:
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - abbr
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.snippets
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+  - footnotes
+  - pymdownx.emoji:
+      emoji_index: !!python/name:materialx.emoji.twemoji
+      emoji_generator: !!python/name:materialx.emoji.to_svg
+  - pymdownx.arithmatex:
+      generic: true
+  # - toc:
+  #     permalink: true
+  # - markdown.extensions.codehilite:
+  #     guess_lang: false
+  # - admonition
+  # - codehilite
+  # - extra
+  # - pymdownx.superfences:
+  #     custom_fences:
+  #     - name: mermaid
+  #       class: mermaid
+  #       format: !!python/name:pymdownx.superfences.fence_code_format ''
+  # - pymdownx.tabbed
+
+
+exclude_docs: |
+  /miles/configuration-intro.md
+
+hooks:
+  - scripts/miles/docs_site.py
+
+plugins:
+  - search
+nav:
+  - Overview: index.md
+  - Get Started:
+    - get_started/installation.md
+    - get_started/ai2_internal_setup.md
+  - Models:
+    - olmo3.md
+    - olmo2.md
+    - tulu3.md
+    - tulu1_tulu2.md
+  - Training:
+    - algorithms/dataset_transformation.md
+    - algorithms/trained_model_location.md
+    - algorithms/finetune.md
+    - algorithms/sft_running_guide.md
+    - algorithms/tpu_sft_guide.md
+    - algorithms/dpo.md
+    - algorithms/grpo.md
+    - algorithms/olmo_core_sharding.md
+    - algorithms/tool_training.md
+    - algorithms/reward_modeling.md
+    - verify-tokenization.md
+    - slack-alerts.md
+  - Integrations:
+    - MILES:
+      - Overview: miles/index.md
+      - Getting started:
+        - GRPO guide: miles/grpo.md
+        - Support and limits: miles/feature-parity.md
+        - Development defaults: miles/development-defaults.md
+        - Workflow: miles/workflow.md
+        - Launching: miles/launching.md
+      - Models and training:
+        - Models and checkpoints: miles/models-and-checkpoints.md
+        - Hybrid MoE support: miles/moe-model-support.md
+        - OLMo 3.5 Small on B300: miles/olmo35-small.md
+        - Core-compatible serving: miles/core-compatible-serving.md
+        - Topology and capacity: miles/topology.md
+        - Long sequences: miles/long-sequences.md
+        - Sequence packing: miles/sequence-packing.md
+        - Async queues: miles/async-pipeline.md
+        - Engine drain: miles/engine-drain.md
+        - Experimental OPD: miles/opd.md
+      - Data and evaluation:
+        - Data and rewards: miles/data-and-evaluation.md
+        - Dataset reward verifiers: miles/dataset-verifiers.md
+        - Grading inputs and changes: miles/grading.md
+        - Dataset source preparation: miles/source-preparation.md
+        - Managed judges: miles/managed-judges.md
+        - Background evaluation: miles/background-evaluation.md
+        - Inference records: miles/inference-records.md
+      - Operations and development:
+        - Operations: miles/operations.md
+        - Throughput: miles/throughput-profiles.md
+        - Compiler caches: miles/compiler-cache.md
+        - Architecture: miles/architecture.md
+        - Implementation contracts: miles/core.md
+      - Reference:
+        - Configuration: miles/configuration.md
+        - Run controls: miles/run-controls.md
+        - Native options: miles/native-options.md
+        - MILES options: miles/native-training-options.md
+        - SGLang options: miles/native-serving-options.md
+  - Not Maintained:
+    - algorithms/synthetic_preference_dataset.md
+
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js

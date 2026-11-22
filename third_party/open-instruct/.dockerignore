@@ -1,0 +1,94 @@
+# Git directories (can be large)
+**/.git/
+.gitignore
+.github/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+local_dataset_cache/
+
+
+# Virtual environments
+# Use **/ so nested venvs are excluded too: patterns are matched relative to the
+# context root, so a bare `.venv/` misses `oe-eval-internal/.venv/`. That matters
+# because uv builds venvs whose bin/python symlinks to the host interpreter, and
+# the dangling symlink fails the COPY checksum ("... .venv/bin/python: not found").
+**/.venv/
+**/venv/
+**/ENV/
+**/env/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test and documentation
+tests/
+test/
+docs/
+*.md
+!README.md
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+*.db
+
+# Package manager files
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Model and data files (if stored locally)
+*.ckpt
+*.pth
+*.h5
+*.safetensors
+data/
+models/
+checkpoints/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Cache directories
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# Docker files (avoid recursion)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Personal MILES run configs and local run artifacts.
+/runs/

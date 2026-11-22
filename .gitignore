@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Runs / outputs / weights
+runs/
+outputs/
+checkpoints/
+*.ckpt
+*.safetensors
+wandb/
+rollouts/
+*.jsonl.gz
+
+# Local env / secrets
+.env
+*.local
+
+# OS
+.DS_Store
+
+# open-instruct build artifacts (vendored source is tracked; its outputs are not)
+third_party/open-instruct/site/
+third_party/open-instruct/oe-eval-internal/
+third_party/open-instruct/.venv/

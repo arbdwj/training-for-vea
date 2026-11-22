@@ -1,0 +1,205 @@
+# Running SFT: a known-good starting point
+
+## Olmo 3.5: one command
+
+```bash
+uv run python scripts/train/sft.py --recipe c12r
+```
+
+`c12r` is the current Olmo 3.5 small recipe: C12 SFT on base B1
+(`olmo35-small-mm-ckpt1-64k` step 20000) plus 10% long-context replay, peak LR 2e-4,
+half an epoch (18,410 steps). It runs on 2×8 B300 on `ai2/holmes` at `high` and
+takes about 9 h. It is the `b1-c12r-gpu` arm of H182, an internal Ai2 post-training
+experiment (H-numbers here are its internal tracking IDs).
+
+- **Another base:** `--checkpoint <dir> --name <run>`. The checkpoint must be an
+  OLMo-core DCP (the `model_and_optim` directory); HF checkpoints are not accepted.
+- **Output:** `/weka/oe-adapt-default/allennlp/deletable_checkpoint/<you>/sft/<name>`,
+  with a permanent checkpoint half way through and one at the end. It is a deletable
+  scratch location: copy out anything you want to keep. The directory has no timestamp,
+  so running the same command again resumes from its latest checkpoint. Beaker
+  requeues the job after a preemption on its own.
+- **Other flags:** `--seed` (data order), `--steps`, `--workspace`, `--priority`, and
+  `--dry_run`, which prints the mason command without launching it.
+- **Nothing to build:** each recipe pins the Beaker image it runs with, so the
+  training code comes from that image, not from your checkout.
+
+### Olmo 3.5 Small (A4B)
+
+```bash
+uv run python scripts/train/sft.py --recipe a4b
+```
+
+`a4b` is `c12r` (same data, replay, seeds and 18,410 steps) on the Olmo 3.5 Small
+hero (the A4B MoE) at its 4T decay endpoint (`olmo35-4b-active-4t-decay159k-causal`
+step 162974), peak LR 7.3e-5, with experts sharded 8 ways inside each node and the
+fused linear+CE loss. It runs on 2×8 B300 on `ai2/holmes`; about 7.4 s/step and 38 h are
+estimates from a 300-step run of the same flags (with the nested checkpoints off, per #2291)
+on the earlier image `01M6XV36`. The pinned image passed a 40-step smoke test (8.20 s/step
+over steps 10–40, matching CE); no full training run has used this recipe yet. It pins its
+own image because main's image has no transformer-engine, which the A4B MoE needs; that
+image also holds the model config (`scripts/c12/a4b_sft_config.json`), with whole-block
+recompute and the nested attention/MoE checkpoints off. All CLI flags documented above for
+`c12r` apply.
+
+Exporting these checkpoints to HF for evaluation is not yet one command; it follows
+ledger hypothesis H167's G4 step.
+
+## Olmo 3 7B dense (one node)
+
+**One epoch of Dolci-Instruct-SFT, one 8×H100 node.**
+
+Measured cost and outcome: ~1.5 h tokenization (CPU, 0 GPUs) + ~9.5 h training
+(~77 GPU-hours) + ~15 min per checkpoint to evaluate. IFBench +6.7 and GSM8K +1.8
+over the base model, which lands 2.4 points under the released
+`Olmo-3-7B-Instruct-SFT` on IFBench.
+
+The recipe is [`scripts/train/debug/oc_sft_olmo3_7b_1node.sh`](https://github.com/allenai/open-instruct/blob/main/scripts/train/debug/oc_sft_olmo3_7b_1node.sh).
+Read its header before editing it: several flags look wrong and are not, and the
+reasons are recorded there rather than repeated here. For a flag-by-flag reference
+see [Supervised finetuning](finetune.md).
+
+### Example runs
+
+| Report | What it is |
+|---|---|
+| [Olmo 3 7B SFT pipeline validation](https://wandb.ai/ai2-llm/open_instruct_internal/reports/Olmo-3-7B-SFT-pipeline-validation-and-eval-results--VmlldzoxNzcwOTIyMg) | This recipe, verbatim. [Beaker](https://beaker.org/ex/01KZHT32T30M2VHCWKRJS1G9P7) · [W&B run](https://wandb.ai/ai2-llm/open_instruct_internal/runs/ed453531) |
+| [Olmo-Hybrid-7B SFT](https://wandb.ai/ai2-llm/open_instruct_internal/reports/Olmo-Hybrid-7B-SFT-through-open-instruct-it-works-on-Blackwell--VmlldzoxNzcyMjMzOQ) | The same recipe pointed at the hybrid base model. [Beaker](https://beaker.org/ex/01M013HTEWJYVHAKPHHJ762YJW) |
+
+### Before you start
+
+- Ai2-internal only: Beaker access, Docker, and `beaker account whoami` working.
+- `build_image_and_launch.sh` refuses to run with uncommitted changes, so commit first.
+- Steps 1–3 run from an open-instruct checkout; step 4 runs from an
+  [olmo-eval](https://github.com/allenai/olmo-eval) checkout (`uv sync --frozen`).
+
+### 1. Tokenize (CPU job, ~1.5 h)
+
+Training hard-fails if the pre-tokenized cache is missing, so tokenization is a
+separate job:
+
+```bash
+./scripts/train/build_image_and_launch.sh scripts/train/debug/oc_sft_olmo3_7b_1node.sh tokenize
+```
+
+The cache key hashes the tokenizer config, mixer, transform functions,
+`max_seq_length` and seed. Both jobs read those from shared variables at the top of
+the script so they cannot drift — if you change one, change it once, and re-tokenize.
+Any divergence produces a different key and training fails as though tokenization
+never ran. Never symlink a cache built at a shorter `max_seq_length` into a longer
+run's cache path: its rows were truncated at tokenize time and training doesn't
+check, so the run trains on short data while its config and logs report the long
+length.
+
+Wait for this job to reach exit 0 before launching step 2.
+
+### 2. Train (1×8 H100, ~9.5 h)
+
+```bash
+./scripts/train/build_image_and_launch.sh scripts/train/debug/oc_sft_olmo3_7b_1node.sh train
+```
+
+What a healthy run looks like: 1,723 steps for the epoch, CE from ~1.20 down to
+~0.65, smooth, with no instability after the LR peaks around step 52. Step count is
+a function of the mixture and chat template, not a constant — `tokenizer_default`
+resolves to the tokenizer's own template, which prepends a function-calling system
+block to every conversation without a system message, so rows average 840 tokens
+rather than the ~643 you get under the `olmo_thinker` templates.
+
+Checkpoints are written every 345 steps — five per epoch, which is what the eval
+table below covers — into the directory the job logs as `CHECKPOINT_OUTPUT_DIR`.
+
+If the job stays queued, run `beaker job events <job-id>` and read the scheduler's own
+reason — the two common ones need opposite fixes, and both are spelled out in the
+script header. Do not guess from cluster docs.
+
+### 3. Convert checkpoints to HuggingFace
+
+olmo-eval can serve a raw olmo-core checkpoint, but the verified path exports to HF
+first. One 0-GPU job per checkpoint:
+
+```bash
+CKPT=<the checkpoint directory the training job wrote to>
+STEP=1723
+BEAKER_IMAGE=<the image build_image_and_launch.sh printed in step 1>
+
+uv run python mason.py \
+    --cluster ai2/saturn ai2/neptune ai2/ceres \
+    --workspace ai2/open-instruct-dev \
+    --priority urgent \
+    --image "$BEAKER_IMAGE" \
+    --description "Convert Olmo-3-7B SFT step$STEP -> HF" \
+    --pure_docker_mode \
+    --num_nodes 1 \
+    --gpus 0 \
+    --no_auto_dataset_cache \
+    -- uv run python scripts/train/convert_olmo_core_to_hf.py \
+    --checkpoint-dir $CKPT/step$STEP/model_and_optim \
+    --model-name allenai/Olmo-3-1025-7B \
+    --tokenizer-name allenai/olmo-3-tokenizer-instruct-dev \
+    --output-dir $CKPT/hf_step$STEP
+```
+
+Pass the same tokenizer you trained with. The exported directory carries its chat
+template, which is what makes the model answer chat-formatted eval prompts at all.
+
+### 4. Evaluate
+
+From an olmo-eval checkout, one job per checkpoint on 1 GPU (~15 min each).
+`$CKPT` and `$STEP` are the same as in step 3:
+
+```bash
+uv run olmo-eval beaker launch \
+    -n olmo3-7b-sft-step$STEP \
+    -m $CKPT/hf_step$STEP \
+    -t ifeval_ood -t gsm8k \
+    --harness default \
+    -o provider.tokenizer=allenai/olmo-3-tokenizer-instruct-dev \
+    -c ai2/ceres -c ai2/jupiter \
+    -w ai2/open-instruct-dev \
+    -B ai2/oe-other \
+    -p urgent \
+    --no-follow
+```
+
+Evaluate the base model the same way, with `-m allenai/Olmo-3-1025-7B`, so the delta
+isolates the weights. `ifeval_ood` (IFBench, 300 prompts) moves early under
+instruction tuning and `gsm8k` (1,319 problems) is the regression check; both are
+cheap. Swap in a larger suite once you care about a specific claim.
+
+Results print as a `Results Summary` table at the end of the job log and are written
+to `/results/metrics.json`:
+
+| checkpoint | epoch | `ifeval_ood` | `gsm8k` |
+|---|---|---|---|
+| base `Olmo-3-1025-7B` | 0.00 | 0.1833 | 0.7430 |
+| step 345 | 0.20 | 0.2367 | 0.7210 |
+| step 690 | 0.40 | 0.2200 | 0.7445 |
+| step 1035 | 0.60 | 0.2133 | 0.7362 |
+| step 1380 | 0.80 | 0.2633 | 0.7597 |
+| step 1723 | 1.00 | 0.2500 | 0.7612 |
+
+Treat differences of a few points as noise: the standard error on an IFBench
+difference is ~3.5 points at 300 prompts, so the shape of that column is flat after
+the first checkpoint, and the apparent peak at step 1380 is not separable from
+sampling variation.
+
+!!! warning "A metric of exactly 0.0000 is a broken run, not a bad model"
+    olmo-eval reports the experiment as `Success` when every generation request
+    fails. It is almost always a missing chat template — check the `-m` directory has
+    one, and that `provider.tokenizer` points at a tokenizer that does.
+
+### Changing the recipe
+
+- **Other base models.** `--config_name` must resolve to an olmo-core
+  `TransformerConfig` preset; there is no fallback if it does not. Architectures
+  olmo-core has no preset or HF weight conversion for need both written first —
+  see the Olmo-Hybrid report above for what that costs.
+- **Other node counts.** Hold the global batch at 1,048,576 tokens:
+  `per_device × grad_accum × (world_size / cp_degree) × seq_len`. Adjust
+  `gradient_accumulation_steps`, not the sequence length.
+- **Verify conversions numerically.** If you write or change olmo-core ↔ HF weight
+  conversion, compare a forward pass against the HF reference before training on it.
+  Structural checks — key and shape matching, config round trips, state-dict round
+  trips — all pass cleanly on numerically broken code; in the Olmo-Hybrid work three
+  green CPU checks missed a 38% logit error caused by a single hardcoded epsilon.

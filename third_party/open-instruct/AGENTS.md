@@ -1,0 +1,80 @@
+# Reinforcement learning
+
+For new RL, RLVR or GRPO work with supported Olmo MoE models, use
+`python -m open_instruct.miles` and follow [the MILES guide](docs/miles/grpo.md),
+including its launch checks and configuration conventions. Existing Core/vLLM
+(`grpo.py`) and DeepSpeed/vLLM (`grpo_fast.py`) workflows remain current alternatives
+for dense-model training; see [their guide](docs/algorithms/grpo.md).
+Choose according to model and workload support, preserve the user's selected
+workflow, and identify support gaps explicitly. MILES does not deprecate the
+existing GRPO trainers.
+
+For MILES GPU runs on `ai2/jupiter` or `ai2/saturn` (CUDA 12.8 host drivers), keep
+the pinned MILES image: RunSpec defaults `launch.env.LD_LIBRARY_PATH` to the image's
+CUDA compatibility libraries, and an explicit value wins. Revalidate CUDA
+initialization and a short training run when the image or driver changes. See
+[Jupiter CUDA compatibility](docs/miles/launching.md#jupiter-cuda-compatibility).
+
+# Bash commands
+- `uv run pytest`: Run the tests.
+- `make style && make quality` run the linter + formatter.
+- `uv run mkdocs serve`: View the documentation locally at http://127.0.0.1:8000/
+- `uv run mkdocs build`: Build the documentation to the `site/` directory.
+
+
+
+## Code Review Rules
+
+Read and follow [CODE_REVIEW.md](CODE_REVIEW.md) when reviewing code.
+
+# Workflow
+- Begin every GitHub comment published by an agent with one plain line naming the agent (e.g. Codex, Claude Code): `Drafted by {agent name}.`, with no alert or other formatting. If a person reviewed the response before publication, use `Drafted by {agent name} and reviewed by {reviewer's name}.` instead. Only include the review attribution when that person actually reviewed the response; permission to post alone does not count as review.
+- When a PR changes anything under `open_instruct/`, add a summary to `CHANGELOG.md` with a link to the PR (e.g., `- Description of change (https://github.com/allenai/open-instruct/pull/123).`). This is what CI enforces; PRs touching only `scripts/`, docs, or config are exempt, though an entry is still welcome for anything user-visible.
+  - The entry must contain the PR's own URL, which does not exist until the PR is opened. Add the entry, open the PR, then amend the entry with the URL and push again.
+  - To skip the check deliberately, put `CHANGELOG=<reason>` in the PR body.
+- Always run the linter and make sure the tests pass before finishing a task.
+- Prefer running single tests, not the whole suite, when developing.
+- Launch Beaker experiment and test scripts with `./scripts/train/build_image_and_launch.sh [--cuda-version 12|13 [--moe]] SCRIPT` after committing all changes. CUDA 13 images are for compatible clusters such as `ai2/holmes`. MoE v2 (`OLMoDDPModel`) models, such as Olmo 3.5 Small, need `--cuda-version 13 --moe`: that image adds transformer-engine. MILES uses `--miles CONFIG` and its pinned runtime.
+- For the Core/vLLM and DeepSpeed/vLLM GRPO workflows, we have three test scripts (for MILES checks, follow `docs/miles/architecture.md`):
+  - `scripts/train/debug/single_gpu_on_beaker.sh`: single GPU, no tools (~8 minutes).
+  - `scripts/train/debug/tools/olmo_3_parser_multigpu.sh`: multi GPU, with tools.
+  - `scripts/train/debug/large_test_script.sh`: two 8x GPU nodes, no tools (~32 minutes).
+- For OLMo-core SFT, we have two test scripts:
+  - `scripts/train/debug/oc_sft.sh`: single GPU on Beaker.
+  - `scripts/train/debug/oc_sft_multinode.sh`: two 8x GPU nodes on Beaker.
+- For DPO, we have three test scripts:
+  - `scripts/train/debug/dpo/local.sh`: local single GPU (no Beaker).
+  - `scripts/train/debug/dpo/single_gpu.sh`: single GPU on Beaker.
+  - `scripts/train/debug/dpo/multi_node.sh`: two 8x GPU nodes on Beaker.
+- Launch the GPU tests with `./scripts/train/build_image_and_launch.sh scripts/test/run_gpu_pytest.sh`.
+- CI runs on GitHub-hosted runners without Beaker experiments or image publication. Run GPU tests manually when a change touches GPU code paths. Record `GPU_TESTS=[EXPERIMENT_ID](https://beaker.org/ex/EXPERIMENT_ID)` in the PR body for reviewers; CI does not parse or verify this line, and `GPU_TESTS=bypass` has no effect. The experiment must actually run `scripts/test/run_gpu_pytest.sh`; record training/debug smoke runs separately. Existing `open_instruct_auto*` images are no longer refreshed by CI; build from the intended revision with the launcher.
+- If you are given a Beaker URL (`beaker.org` or `beaker.allen.ai`), use the Beaker CLI tool to interact with it.
+- When a Beaker job stays queued or pending, run `beaker job events <job-id>` before diagnosing why — it prints the scheduler's own reason; don't infer one from cluster documentation. If that reason is the workspace slot limit, it applies to every cluster at once: wait or request fewer GPUs rather than relaunching elsewhere.
+- A Beaker experiment can hold several jobs when a preempted one is retried. Read the most recently created attempt for each task and replica rank, not `jobs[0]` or one latest job for the entire experiment, or a successful retry looks like a failure and missing replicas can be overlooked.
+- Mason's `--min_runtime <duration>` sets Beaker's `minRuntime` (0, or a duration with a unit of at least 5m, such as `30m`; Ai2 clusters currently allow at most 8h), and `--auto_resume` sets `autoResume`. On allocation-scheduled clusters, a job with a min runtime above 0 is allocated: it queues ahead of backfill and is protected until its min runtime ends, and shorter min runtimes schedule sooner. Its workspace needs an allocation on that cluster, or Beaker rejects it at submission. The legacy `--preemptible` switch, which cannot be combined with `--min_runtime`, maps to `minRuntime: 0` and `autoResume: true`; such unallocated jobs run only as backfill and may wait indefinitely. Passing neither flag maps to an eight-hour protected, non-resumable job, the hardest kind to schedule. Prefer a realistic `--min_runtime` (the time the job needs to reach a checkpoint), and call out this choice before launching instead of silently copying a checked-in script's choice.
+- On macOS, GRPO launch scripts that call `mason.py` need `--no_auto_dataset_cache` (before the `--` separator). Local dataset caching runs the training entrypoint with `--cache_dataset_only`, and `grpo.py` / `grpo_fast.py` still import vllm at module level (`grpo_fast.py` from `vllm.distributed.weight_transfer`, `grpo.py` via `vllm_utils`), which is not installed on Darwin. `finetune.py`, `dpo.py`, `dpo_tune_cache.py` and `reward_modeling.py` no longer import vllm on this path since [#1866](https://github.com/allenai/open-instruct/pull/1866), so their scripts do not need the flag. `mason.py` prints a macOS hint but still attempts caching, so it does not protect you either way.
+- The `oe-eval-internal` directory is required in the Docker image for experiments that use `--try_launch_beaker_eval_jobs_on_weka`. If it's missing (e.g. in a fresh clone or worktree), clone it with: `git clone --depth=1 https://github.com/allenai/oe-eval-internal.git oe-eval-internal`.
+- When updating PR bodies with experiment results, use the "Runs:" format (numbered list with Beaker links):
+  ```
+  Runs:
+
+  1. Description: [Beaker](https://beaker.org/ex/EXPERIMENT_ID)
+  2. Description: [Beaker](https://beaker.org/ex/EXPERIMENT_ID)
+  ```
+
+# Naming conventions
+- Models OLMo and OLMo 2 (versions <=2) use the "OLMo" capitalization style.
+- Olmo 3, Olmo Hybrid, and later models use "Olmo" (standard proper noun capitalization).
+- Note: "OLMo-core" refers to the software repository and keeps its original capitalization.
+
+# Coding conventions
+- Never use `import logging` or `logging.info()` directly. Always use `logger = logger_utils.setup_logger(__name__)` and `logger.info()`.
+- Imports always go at the top of the file, never inline.
+- Use `from package import module` instead of `import package.module`.
+
+# Documentation
+To verify that documentation changes don't alter the generated output:
+1. Build docs on your branch: `uv run mkdocs build && cp -r site site-branch`
+2. Switch to main branch and build: `cd /path/to/main && uv run mkdocs build`
+3. Compare the builds: `diff -rq site-branch /path/to/main/site`
+4. If no output, the docs are identical. If differences exist, review with: `diff -r site-branch /path/to/main/site`
