@@ -70,5 +70,9 @@ export OPEN_INSTRUCT_RAY_OBJECT_STORE_MEMORY="${OPEN_INSTRUCT_RAY_OBJECT_STORE_M
 
 echo "CUDA_HOME=${CUDA_HOME:-UNSET}  nvcc=$(command -v nvcc || echo none)  DS_SKIP_CUDA_CHECK=$DS_SKIP_CUDA_CHECK"
 echo "CXX=${CXX:-unset} ($([ -n "${CXX:-}" ] && "$CXX" -dumpversion 2>/dev/null))  ulimit -n=$(ulimit -n)  RAY_CPUS=$OPEN_INSTRUCT_RAY_NUM_CPUS"
-[ -z "${CXX:-}" ] && echo "!! no GCC>=9 found — CPUAdam JIT will fail. Set GCC_MODULE=<module avail gcc>."
-[ -z "${CUDA_HOME:-}" ] && echo "!! CUDA_HOME unset — DeepSpeed will fail. Set CUDA_MODULE=<module> (module avail cuda)."
+if [ -z "${CXX:-}" ]; then echo "!! no GCC>=9 found — CPUAdam JIT will fail. Set GCC_MODULE=<module avail gcc>."; fi
+if [ -z "${CUDA_HOME:-}" ]; then echo "!! CUDA_HOME unset — DeepSpeed will fail. Set CUDA_MODULE=<module> (module avail cuda)."; fi
+# IMPORTANT: end on a success status. A sourced script returns its last command's exit code, and a
+# bare `[ -z X ] && echo` returns 1 whenever X is set (the healthy case) — which would abort a
+# `source setup_env.sh && python ...` chain before python ever runs.
+return 0 2>/dev/null || true
