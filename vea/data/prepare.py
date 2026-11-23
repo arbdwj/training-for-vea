@@ -78,6 +78,15 @@ def to_open_instruct_row(row: dict, verifier: str = "ifeval",
                          ground_truths_key: str = "ground_truth") -> dict:
     prompt = row.get("prompt") or row.get("question") or ""
     gt = row.get("ground_truth")
+    # Dolci stores ground_truth as a list-of-one repr-string: ["[{'instruction_id': ...}]"].
+    # The open-instruct ifeval verifier (ground_truth_utils.IFEvalVerifier) does
+    # `ast.literal_eval(label)[0]`, so `label` must be the STRING "[{...}]" itself, not the
+    # ["[{...}]"] list wrapper. The grpo_fast async reward path (vllm_utils.compute_rewards)
+    # passes ground_truth straight through as `label` (unlike apply_verifiable_reward, which
+    # unwraps a non-str), so a list wrapper here makes literal_eval raise "malformed node or
+    # string" and every rollout's reward silently fails -> DataPreparationActor hangs forever.
+    if isinstance(gt, (list, tuple)) and len(gt) == 1 and isinstance(gt[0], str):
+        gt = gt[0]
     return {
         messages_key: [{"role": "user", "content": prompt}],
         ground_truths_key: gt,
