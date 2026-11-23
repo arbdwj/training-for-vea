@@ -54,6 +54,7 @@ for K in $RUNGS; do
   srun --gpus=4 --cpus-per-task=64 bash -c "
     cd '$PWD' &&
     source scripts/setup_env.sh &&
+    [ -f scripts/storage_env.sh ] && source scripts/storage_env.sh &&   # HF cache/runs on scratch (quota)
     export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 &&
     python scripts/run.py run '$CONFIG' --stages model --only-k $K
   " > "$LOG" 2>&1
