@@ -497,9 +497,9 @@ def accumulate_completions(actor: "LLMRayActor", sub_request: dict) -> futures.F
     actor.request_outputs[base_request_id]["outputs"].append(sub_request["request_output"])
 
     n_now = len(actor.request_outputs[base_request_id]["outputs"])
-    logger.info(f"[VEA accumulate] base={base_request_id}: {n_now}/{expected_n} outputs gathered")
+    logger.debug(f"[VEA accumulate] base={base_request_id}: {n_now}/{expected_n} outputs gathered")
     if n_now == expected_n:
-        logger.info(f"[VEA accumulate] base={base_request_id}: COMPLETE -> scheduling finalize")
+        logger.debug(f"[VEA accumulate] base={base_request_id}: COMPLETE -> scheduling finalize")
         return asyncio.run_coroutine_threadsafe(finalize_completed_request(actor, base_request_id), actor.loop)
 
     return None
@@ -516,7 +516,7 @@ async def finalize_completed_request(actor: "LLMRayActor", base_request_id: str)
 
 
 async def _finalize_completed_request_impl(actor: "LLMRayActor", base_request_id: str) -> None:
-    logger.info(f"[VEA finalize] base={base_request_id}: START")
+    logger.debug(f"[VEA finalize] base={base_request_id}: START")
     outputs = actor.request_outputs[base_request_id]["outputs"]
     ordered_outs = sorted(outputs, key=lambda x: split_request_id(x.request_id)["request_index"])
 
@@ -539,12 +539,12 @@ async def _finalize_completed_request_impl(actor: "LLMRayActor", base_request_id
     actor.request_outputs.pop(base_request_id)
     actor.request_metadata.pop(base_request_id, None)
 
-    logger.info(f"[VEA finalize] base={base_request_id}: computing rewards (awaiting verifier...)")
+    logger.debug(f"[VEA finalize] base={base_request_id}: computing rewards (awaiting verifier...)")
     result.reward_scores, result.reward_metrics = await compute_rewards(actor, result, example)
     results_queue = actor.eval_results_queue if is_eval else actor.results_queue
-    logger.info(f"[VEA finalize] base={base_request_id}: rewards done -> results_queue.put (is_eval={is_eval})")
+    logger.debug(f"[VEA finalize] base={base_request_id}: rewards done -> results_queue.put (is_eval={is_eval})")
     results_queue.put(result)
-    logger.info(f"[VEA finalize] base={base_request_id}: PUSHED to results_queue")
+    logger.debug(f"[VEA finalize] base={base_request_id}: PUSHED to results_queue")
 
 
 def _vea_flatten_ground_truth(gt):
@@ -568,7 +568,7 @@ async def compute_rewards(actor: "LLMRayActor", result: GenerationResult, exampl
     k = len(result.responses)
     _raw_gt = example[GROUND_TRUTHS_KEY]
     _flat_gt = _vea_flatten_ground_truth(_raw_gt)
-    logger.info(
+    logger.debug(
         f"[VEA compute_rewards] GT raw_type={type(_raw_gt).__name__} "
         f"flat_type={type(_flat_gt).__name__} flat={repr(_flat_gt)[:140]}"
     )
@@ -986,13 +986,13 @@ async def _acquire_and_reset_pools(
 
 async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_params: SamplingConfig):
     """Process a single async request with tool/environment support."""
-    logger.info(f"[VEA process_request] {sub_request_id}: START, checking health at port {actor.server_port}")
+    logger.debug(f"[VEA process_request] {sub_request_id}: START, checking health at port {actor.server_port}")
     try:
         await _check_health(actor.server_port)
     except Exception as e:
         logger.error(f"[VEA process_request] {sub_request_id}: HEALTH CHECK FAILED: {type(e).__name__}: {e}")
         raise
-    logger.info(f"[VEA process_request] {sub_request_id}: health OK")
+    logger.debug(f"[VEA process_request] {sub_request_id}: health OK")
 
     response_tokens: list[int] = []
     response_logprobs: list[float] = []
@@ -1050,7 +1050,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             current_sampling_params = dataclasses.replace(sampling_params, max_tokens=current_max_tokens)
             params_dict = dataclasses.asdict(current_sampling_params)
             min_tokens = params_dict.pop("min_tokens", 0)
-            logger.info(
+            logger.debug(
                 f"[VEA process_request] {sub_request_id}: POST completions.create "
                 f"prompt_len={len(current_prompt)} max_tokens={current_max_tokens} (awaiting vLLM server...)"
             )
@@ -1068,7 +1068,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             )
 
             output = api_response.choices[0]
-            logger.info(
+            logger.debug(
                 f"[VEA process_request] {sub_request_id}: GOT RESPONSE, "
                 f"{len(list(output.token_ids))} tokens, text_len={len(output.text or '')}"
             )
