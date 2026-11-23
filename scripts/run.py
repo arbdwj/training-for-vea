@@ -183,6 +183,9 @@ def main():
     r.add_argument("--stages", default=None, help="comma list subset of model,eval,judge")
     r.add_argument("--backend", default=None, choices=["local", "modal", "slurm"])
     r.add_argument("--limit", type=int, default=None, help="judge: cap rollouts (stratified) for a cheap live test")
+    r.add_argument("--only-k", type=int, default=None,
+                   help="train: override the dataset k-filter to a single rung (process isolation: "
+                        "run one rung per process so a rung-boundary OOM can't kill the others)")
     args = ap.parse_args()
 
     if args.cmd == "run":
@@ -191,6 +194,9 @@ def main():
         except cfgmod.ConfigError as e:
             print(f"config error: {e}", file=sys.stderr)
             sys.exit(1)
+        if args.only_k is not None and cfg.model and cfg.model.dataset:
+            cfg.model.dataset.filter = {"k": [args.only_k]}
+            print(f"[run] --only-k {args.only_k}: training this single rung only")
         want = set(cfg.stages)
         if args.stages:
             want = {s.strip() for s in args.stages.split(",") if s.strip()}
