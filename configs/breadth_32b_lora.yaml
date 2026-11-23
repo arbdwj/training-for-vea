@@ -37,8 +37,8 @@ model:                               # STAGE 1 — all 5 rungs, ~20 steps each, 
     temperature: 1.0
     beta: 0.0
     loss_fn: dapo
-    max_steps: 20
-    save_steps: 20
+    max_steps: 8                        # first-pass: 8 steps x 5 rungs fits a ~3h 4-GPU salloc
+    save_steps: 8                        # must be <= max_steps so each rung's adapter saves
   cluster:                             # 4-GPU: 3 learners (replicated frozen base) + 1 vLLM engine
     deepspeed_stage: 2                 # ZeRO-2: base REPLICATED per learner (64GB bf16 < 97GB), only
                                        #  the tiny adapter grads/optimizer are sharded. Stage 2 (not 3)
