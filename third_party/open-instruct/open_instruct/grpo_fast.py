@@ -945,7 +945,7 @@ class PolicyTrainerRayProcess(RayProcess):
             # only save peft weights https://github.com/microsoft/DeepSpeed/issues/4295
             if isinstance(model_to_save, PeftModel):
                 model_to_save.save_pretrained(output_dir)
-                if self.stage == 3:
+                if self.args.deepspeed_stage == 3:
                     torch.save(
                         get_peft_model_state_dict(model_to_save, output_state_dict), output_path / "adapter_model.bin"
                     )
