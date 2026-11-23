@@ -547,11 +547,32 @@ async def _finalize_completed_request_impl(actor: "LLMRayActor", base_request_id
     logger.info(f"[VEA finalize] base={base_request_id}: PUSHED to results_queue")
 
 
+def _vea_flatten_ground_truth(gt):
+    """Collapse single-element list nesting down to the ifeval repr-string.
+
+    Dolci stores ground_truth as ["[{...}]"] (list of one repr-string). open-instruct's
+    dataset transform wraps the column once more, so for ifeval the value reaching
+    compute_rewards is [["[{...}]"]] (doubly nested). IFEvalVerifier expects its `label`
+    to be the STRING "[{...}]" (it does ast.literal_eval(label)[0]); a list label raises
+    "malformed node or string" and every reward silently fails. Collapse any single-element
+    list/tuple nesting to that string; a genuine multi-entry list (len>1) is left untouched.
+    """
+    while isinstance(gt, (list, tuple)) and len(gt) == 1:
+        gt = gt[0]
+    return gt
+
+
 async def compute_rewards(actor: "LLMRayActor", result: GenerationResult, example: dict) -> tuple[list[float], dict]:
     decoded_responses = actor.llm_engine.tokenizer.batch_decode(result.responses, skip_special_tokens=True)
 
     k = len(result.responses)
-    k_ground_truths = [example[GROUND_TRUTHS_KEY]] * k
+    _raw_gt = example[GROUND_TRUTHS_KEY]
+    _flat_gt = _vea_flatten_ground_truth(_raw_gt)
+    logger.info(
+        f"[VEA compute_rewards] GT raw_type={type(_raw_gt).__name__} "
+        f"flat_type={type(_flat_gt).__name__} flat={repr(_flat_gt)[:140]}"
+    )
+    k_ground_truths = [_flat_gt] * k
     k_datasets = [example[VERIFIER_SOURCE_KEY]] * k
     k_raw_queries = [example[RAW_PROMPT_KEY]] * k
 
