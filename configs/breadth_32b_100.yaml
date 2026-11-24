@@ -1,0 +1,99 @@
+# 32B LoRA-RL breadth sweep — REAL RUN (100 steps/rung) testing the OOD-transfer hypothesis:
+#   "training on MORE stacked constraints -> higher eval-awareness that TRANSFERS OOD."
+#
+# This is the scale-up retest of the 7B breadth experiment (complexity_vs_vea), which was
+# NULL in-distribution (OLS slope -0.10 pp/constraint, k1 vs k5 CIs overlap). VEA is strongly
+# scale-dependent (32B ~21% vs 7B ~7.6%), so the effect may need the extra capacity.
+#
+# PRIMARY OUTCOME = OOD VEA vs TRAINING-breadth: eval each k=1..5 adapter on 4 held-out domains
+# (code/general/math/mix, one VEA number each) + if.jsonl as the in-distribution control/curve.
+# Prediction: positive slope (k5 adapter more eval-aware OOD than k1).
+#
+# Fresh output_dir (runs/breadth_32b_100) so it does NOT collide with the 8-step smoke in
+# runs/breadth_32b_lora. Judging is done OFF-NODE (pull rollouts -> API judge on the Mac);
+# the judge section below is a placeholder the node run never reaches (it banks rollouts).
+#
+# Submit as TWO jobs (train ~16-18h, then eval ~10-12h — each under the 24h cap). NOTE the two
+# sbatch scripts take the config DIFFERENTLY: run_breadth_rungs reads $CONFIG (env), $1 = rungs;
+# run_eval_judge takes the config as $1.
+#   1) TRAIN:  sbatch --export=ALL,CONFIG=configs/breadth_32b_100.yaml scripts/run_breadth_rungs.sbatch "1 2 3 4 5"
+#   2) EVAL:   sbatch scripts/run_eval_judge.sbatch configs/breadth_32b_100.yaml   (judge auto-skips -> judge off-node)
+name: breadth_32b_100
+backend: local
+output_dir: runs/breadth_32b_100
+
+model:                               # STAGE 1 — all 5 rungs, 100 steps each, LoRA on 4 GPUs
+  source: train
+  framework: open_instruct
+  base: allenai/Olmo-3-32B-Think-DPO   # DPO = correct pre-RL checkpoint (base->SFT->DPO->RLVR)
+  finetune: lora                       # -> --use_peft --lora_r 16 --lora_alpha 32 --lora_dropout 0.05
+  dataset:
+    name: allenai/Dolci-RL-Zero-IF-7B
+    filter: {k: [1, 2, 3, 4, 5]}       # the full breadth sweep -> 5 adapters
+    messages_key: messages
+    ground_truths_key: ground_truth
+    verifier: ifeval
+  params:
+    learning_rate: 1.0e-5              # LoRA typically uses a higher LR than full-FT's 2e-6
+    lr_scheduler_type: constant
+    num_samples_per_prompt_rollout: 8
+    num_unique_prompts_rollout: 16
+    response_length: 2048
+    max_prompt_token_length: 2048
+    temperature: 1.0
+    beta: 0.0
+    loss_fn: dapo
+    max_steps: 100                     # REAL run: 100 steps x 5 rungs (~3.3h/rung -> ~16-18h total)
+    save_steps: 25                     # intermediate saves (25/50/75/100) -> VEA-vs-step is available
+                                       #  later for free; merge/eval auto-pick the highest (step_100).
+  cluster:                             # 4-GPU: 3 learners (replicated frozen base) + 1 vLLM engine
+    deepspeed_stage: 2                 # ZeRO-2: base REPLICATED per learner (64GB bf16 < 97GB)
+    deepspeed_offload_param: false
+    deepspeed_offload_optimizer: false
+    num_learners: 3
+    vllm_num_engines: 1
+    vllm_tensor_parallel_size: 1
+    gradient_checkpointing: true
+    attn: sdpa
+    vllm_enforce_eager: true
+    lora: {r: 16, alpha: 32, dropout: 0.05}
+  backend: {type: local, gpus: 4}
+
+eval:                                  # STAGE 2 — all 5 adapters, 32B at TP=4, on 5 domains
+  # THE OOD-TRANSFER PROBES. code/general/math/mix are held-out domains (k=None, 100 each) ->
+  # one VEA number per (adapter, domain) = the transfer outcome. if.jsonl (stratified 100xk=1..5)
+  # is the IN-DISTRIBUTION control + the eval-time stacking curve. All repo-committed, so they
+  # resolve on the node after `git pull`.
+  datasets:
+    - name: if                         # in-distribution control + stacking curve
+      path: datasets/vshift/if.jsonl
+      bucket_by: k
+      filter: {k: [1, 2, 3, 4, 5]}
+      n_per_bucket: 100
+    - {name: code,    path: datasets/vshift/code.jsonl,    n: 100}   # OOD transfer
+    - {name: general, path: datasets/vshift/general.jsonl, n: 100}   # OOD transfer
+    - {name: math,    path: datasets/vshift/math.jsonl,    n: 100}   # OOD transfer
+    - {name: mix,     path: datasets/vshift/mix.jsonl,     n: 100}   # OOD transfer
+  generation:
+    rollouts: 4
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 2048
+    seed: 42
+    template: olmo_think
+  backend: {type: local, gpus: 4, tensor_parallel: 4, enforce_eager: true, gpu_memory_utilization: 0.90}
+
+judge:                                 # STAGE 3 — PLACEHOLDER. Judging is done OFF-NODE (pull
+  # rollouts -> API judge on the Mac, as validated). The node's judge step auto-skips (Nemotron
+  # not cached) and banks rollouts. group_by includes `domain` so the off-node judge emits the
+  # per-domain OOD-transfer numbers (by_domain) alongside the if stacking curve (by_k).
+  judges:
+    - name: vea
+      kind: llm
+      model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8   # unused on-node; off-node driver overrides
+      provider: vllm
+      opts: {tensor_parallel: 4, max_model_len: 12000}
+      prompt: prompts/vea_judge_scored
+      parse: score_quote
+  aggregate: per_rollout
+  group_by: [model, domain, k]
