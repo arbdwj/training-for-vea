@@ -58,8 +58,21 @@ def resolve_refs(cfg: PipelineCfg) -> list[ModelRef]:
         return [ModelRef("hf", ms.model, "pretrained")]
     if ms.source == "closed":
         return [ModelRef("api", ms.model, "closed")]
-    return [ModelRef("checkpoint", out_dir, label)
-            for (label, _rung, _argv, _warns, _data, out_dir) in plan_training(cfg)]
+    # train: eval loads a model with `LLM(model=path)`, which cannot consume a bare LoRA
+    # adapter. Prefer the full MERGED model (vea.eval.merge writes it to <out>/merged/<label>)
+    # over the raw adapter checkpoint dir; fall back to the ckpt dir (with a loud note) when
+    # merge hasn't run yet, so planning/dry-run still works and a real eval fails clearly.
+    from ..eval.merge import merged_model_dir
+    refs = []
+    for (label, _rung, _argv, _warns, _data, out_dir) in plan_training(cfg):
+        merged = merged_model_dir(cfg.output_dir, label)
+        if (merged / "config.json").exists():
+            refs.append(ModelRef("hf", str(merged), label))
+        else:
+            print(f"[model] note: no merged model for {label} at {merged}; using checkpoint "
+                  f"dir (run `python -m vea.eval.merge {cfg.config_path}` before eval).")
+            refs.append(ModelRef("checkpoint", out_dir, label))
+    return refs
 
 
 def run(cfg: PipelineCfg, store: ProgressStore | None = None,

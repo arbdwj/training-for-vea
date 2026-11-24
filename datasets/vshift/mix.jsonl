@@ -1,0 +1,100 @@
+{"prompt_id": "mix_0", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_1", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_2", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_3", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_4", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_5", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_6", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_7", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_8", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_9", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_10", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_11", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_12", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_13", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_14", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_15", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_16", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_17", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_18", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_19", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_20", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_21", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_22", "domain": "mix", "k": null, "prompt": "Compute the sum of all the roots of  \n\\((2x+3)(x-4)+(2x+3)(x-6)=0\\).  \nExpress your answer as a fraction in simplest form \\(\\frac{k}{m}\\), and provide the value of \\(k + m\\)."}
+{"prompt_id": "mix_23", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_24", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_25", "domain": "mix", "k": null, "prompt": "$K$ takes 30 minutes less time than $M$ to travel a distance of 30 miles. $K$ travels $\\frac{1}{3}$ mile per hour faster than $M$. If $x$ is $K$'s rate of speed in miles per hour, find $K$'s time for the distance in hours. The original answer is in the form \\(\\frac{k}{x}\\), please give the value of \\(k\\)."}
+{"prompt_id": "mix_26", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_27", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_28", "domain": "mix", "k": null, "prompt": "An ellipse has foci at $(9, 20)$ and $(49, 55)$ in the $xy$-plane and is tangent to the $x$-axis. What is the length of its major axis?"}
+{"prompt_id": "mix_29", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_30", "domain": "mix", "k": null, "prompt": "Find the least integer $n$ greater than $345$ such that $\\frac{3n+4}{5}$, $\\frac{4n+5}{3}$, and $\\frac{5n+3}{4}$ are all integers."}
+{"prompt_id": "mix_31", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_32", "domain": "mix", "k": null, "prompt": "Let $L$ be the line with slope $\\frac{5}{12}$ that contains the point $A=(24,-1)$ , and let $M$ be the line perpendicular to line $L$ that contains the point $B=(5,6)$ . The original coordinate axes are erased, and line $L$ is made the $x$ -axis and line $M$ the $y$ -axis. In the new coordinate system, point $A$ is on the positive $x$ -axis, and point $B$ is on the positive $y$ -axis. The point $P$ with coordinates $(-14,27)$ in the original system has coordinates $(\\alpha,\\beta)$ in the new coordinate system. Find $\\alpha+\\beta$ ."}
+{"prompt_id": "mix_33", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_34", "domain": "mix", "k": null, "prompt": "Let $\\omega$ be a circle of radius $6$ with center $O$. Let $AB$ be a chord of $\\omega$ having length $5$. For any real constant $c$, consider the locus $\\mathcal{L}(c) $ of all points $P$ such that $PA^2 - PB^2 = c$. Find the largest value of $c$ for which the intersection of $\\mathcal{L}(c)$ and $\\omega$ consists of just one point."}
+{"prompt_id": "mix_35", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_36", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_37", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_38", "domain": "mix", "k": null, "prompt": "Find the value of $\\lfloor 1 \\rfloor + \\lfloor 1.7 \\rfloor + \\lfloor 2.4 \\rfloor + \\lfloor 3.1 \\rfloor + \\cdots + \\lfloor 99 \\rfloor$."}
+{"prompt_id": "mix_39", "domain": "mix", "k": null, "prompt": "Find the number of ordered triples of positive integers $(a, b, c)$ such that \n\\[6a + 10b + 15c = 3000.\\]"}
+{"prompt_id": "mix_40", "domain": "mix", "k": null, "prompt": "Starting with a positive integer $M$ written on the board, Alice plays the following game: in each move, if $x$ is the number on the board, she replaces it with $3x + 2$. Similarly, starting with a positive integer $N$ written on the board, Bob plays the following game: in each move, if $x$ is the number on the board, he replaces it with $2x + 27$. Given that Alice and Bob reach the same number after playing $4$ moves each, find the smallest value of $M + N$."}
+{"prompt_id": "mix_41", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_42", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_43", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_44", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_45", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_46", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_47", "domain": "mix", "k": null, "prompt": "Let $M$ and $m$ be the largest and the smallest values of $x$, respectively, which satisfy $4x(x - 5) \\le 375$. Find $M - m$."}
+{"prompt_id": "mix_48", "domain": "mix", "k": null, "prompt": "In base ten, the number $100! = 100 \\cdot 99 \\cdot  98 \\cdot  97... 2 \\cdot 1$ has $158$ digits, and the last $24$ digits are all zeros. Find the number of zeros there are at the end of this same number when it is written in base $24$."}
+{"prompt_id": "mix_49", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_50", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_51", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_52", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_53", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_54", "domain": "mix", "k": null, "prompt": "Consider polynomial forms $ax^2-bx+c$ with integer coefficients which have two distinct zeros in the open interval $0<x<1$. Exhibit with a proof the least positive integer value of a for which such a polynomial exists."}
+{"prompt_id": "mix_55", "domain": "mix", "k": null, "prompt": "The points $A$, $B$, $C$, $D$, and $E$ lie in one plane and have the following properties:\n\n- $AB = 12$\n- $BC = 50$\n- $CD = 38$\n- $AD = 100$\n- $BE = 30$\n- $CE = 40$\n\nFind the length of the segment $ED$."}
+{"prompt_id": "mix_56", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_57", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_58", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_59", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_60", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_61", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_62", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_63", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_64", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_65", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_66", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_67", "domain": "mix", "k": null, "prompt": "A box contains $28$ red balls, $20$ green balls, $19$ yellow balls, $13$ blue balls, $11$ white balls, and $9$ black balls. What is the minimum number of balls that must be drawn from the box without replacement to guarantee that at least $15$ balls of a single color will be drawn? Provide your answer as an integer."}
+{"prompt_id": "mix_68", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_69", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_70", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_71", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_72", "domain": "mix", "k": null, "prompt": "Mady has an infinite number of balls and empty boxes available to her. The empty boxes, each capable of holding four balls, are arranged in a row from left to right. At the first step, she places a ball in the first box (the leftmost box) of the row. At each subsequent step, she places a ball in the first box of the row that still has room for a ball and empties any boxes to its left. How many balls in total are in the boxes as a result of Mady's $2010$th step?"}
+{"prompt_id": "mix_73", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_74", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_75", "domain": "mix", "k": null, "prompt": "The figure is created by arranging four squares, each with a side length of 5 units, on each side of a central square with a side length of 20 units. Calculate the perimeter of the entire figure."}
+{"prompt_id": "mix_76", "domain": "mix", "k": null, "prompt": "The volume of a certain rectangular solid is $216\\text{ cm}^3$, its total surface area is $288\\text{ cm}^2$, and its three dimensions are in geometric progression. Find the sum of the lengths in cm of all the edges of this solid."}
+{"prompt_id": "mix_77", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_78", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_79", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_80", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_81", "domain": "mix", "k": null, "prompt": "Four circles, no two of which are congruent, have centers at $A$, $B$, $C$, and $D$, and points $P$ and $Q$ lie on all four circles. The radius of circle $A$ is $\\frac{5}{8}$ times the radius of circle $B$, and the radius of circle $C$ is $\\frac{5}{8}$ times the radius of circle $D$. Furthermore, $AB = CD = 39$ and $PQ = 48$. Let $R$ be the midpoint of $\\overline{PQ}$. Find the value of $AR+BR+CR+DR$."}
+{"prompt_id": "mix_82", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_83", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_84", "domain": "mix", "k": null, "prompt": "A solid rectangular block is formed by gluing together $N$ congruent $1-cm$ cubes face to face. When the block is viewed so that three of its faces are visible, exactly $231$ of the $1-cm$ cubes cannot be seen. Find the smallest possible value of $N.$"}
+{"prompt_id": "mix_85", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_86", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_87", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_88", "domain": "mix", "k": null, "prompt": "If $a$ and $b$ are the roots of the equation $x^2 - 2cx - 5d = 0$, and $c$ and $d$ are the roots of the equation $x^2 - 2ax - 5b = 0$, where $a, b, c, d$ are distinct real numbers, find the value of $a + b + c + d$."}
+{"prompt_id": "mix_89", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_90", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_91", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_92", "domain": "mix", "k": null, "prompt": "What is the least positive integer $x$ for which the expression $x^2 + 3x + 9$ has 3 distinct prime divisors?"}
+{"prompt_id": "mix_93", "domain": "mix", "k": null, "prompt": "How many units apart is any pair of parallel sides of a regular hexagon with side of 6 units? Express your answer in simplest radical form.The answer is in the form k\\sqrt{m}+n,. Please provide the value of k + m + n."}
+{"prompt_id": "mix_94", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_95", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_96", "domain": "mix", "k": null, "prompt": "A truck is initially moving at velocity $v$. The driver presses the brake in order to slow the truck to a stop. The brake applies a constant force $F$ to the truck. The truck rolls a distance $x$ before coming to a stop, and the time it takes to stop is $t$.\n\nFind the expression that represents the initial kinetic energy of the truck (i.e., the kinetic energy before the driver starts braking). The answer should be in the form of $kF \\cdot mx$, where $k$ and $m$ are integers. Please give the value of $k + m$."}
+{"prompt_id": "mix_97", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_98", "domain": "mix", "k": null, "prompt": ""}
+{"prompt_id": "mix_99", "domain": "mix", "k": null, "prompt": ""}

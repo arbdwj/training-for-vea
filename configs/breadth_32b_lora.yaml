@@ -56,9 +56,15 @@ model:                               # STAGE 1 — all 5 rungs, ~20 steps each, 
   backend: {type: local, gpus: 4}
 
 eval:                                  # STAGE 2 — all 5 adapters x k=1..5, 32B at TP=4
+  # The constraint-stacking VEA probe (stratified 100xk=1..5, single-turn co-stated
+  # constraints) — the SAME set used for the prior eval-time VEA-vs-breadth baseline, so
+  # these numbers are comparable to it. It's a transfer test too: adapters trained on
+  # Dolci-RL-Zero-IF, this probe is a different prompt source. Repo-relative (committed),
+  # so it resolves on the node after `git pull`. Bump n_per_bucket to 100 (the full probe)
+  # for the publication curve; 20 is a fast end-to-end smoke (low-% VEA needs n>>20 for CI).
   datasets:
     - name: dolci_if
-      path: hf://allenai/Dolci-RL-Zero-IF-7B
+      path: datasets/vshift/if.jsonl
       bucket_by: k
       filter: {k: [1, 2, 3, 4, 5]}
       n_per_bucket: 20
