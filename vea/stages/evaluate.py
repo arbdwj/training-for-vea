@@ -102,8 +102,14 @@ def run_local(stage: EvalStage, model_path: str, model_label: str, prompts_path:
     out_dir = _P(out_dir)
     (out_dir).mkdir(parents=True, exist_ok=True)
     gen = stage.generation
+    # GH200/aarch64: vLLM's CUDA-graph capture / torch.compile path is fragile and crashes
+    # a worker during engine init (this is why the training config sets vllm_enforce_eager).
+    # Default eager here too; let the eval backend override via extra.enforce_eager.
+    extra = getattr(stage.backend, "extra", {}) or {}
     llm = LLM(model=model_path, tensor_parallel_size=tensor_parallel,
-              max_model_len=gen.max_tokens + 2048, trust_remote_code=True)
+              max_model_len=gen.max_tokens + 2048, trust_remote_code=True,
+              enforce_eager=bool(extra.get("enforce_eager", True)),
+              gpu_memory_utilization=float(extra.get("gpu_memory_utilization", 0.90)))
     all_prompts = load_prompts(prompts_path)
     for ds in stage.datasets:
         buckets = (ds.filter.get(ds.bucket_by) if ds.bucket_by and

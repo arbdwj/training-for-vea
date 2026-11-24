@@ -75,7 +75,7 @@ eval:                                  # STAGE 2 — all 5 adapters x k=1..5, 32
     max_tokens: 2048
     seed: 42
     template: olmo_think
-  backend: {type: local, gpus: 4, tensor_parallel: 4}
+  backend: {type: local, gpus: 4, tensor_parallel: 4, enforce_eager: true, gpu_memory_utilization: 0.90}
 
 judge:                                 # STAGE 3 — Nemotron-120B auditor, FP8 at TP=4
   judges:
