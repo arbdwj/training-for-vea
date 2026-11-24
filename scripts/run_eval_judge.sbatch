@@ -50,6 +50,15 @@ if [ $MRC -ne 0 ]; then
   echo "!! merge failed (rc=$MRC) — see $MLOG. Not all adapters merged; eval would be incomplete."
   echo "   (fix the failing rung, then resubmit — merge is idempotent and skips finished rungs.)"
 fi
+# Abort before eval if NOTHING merged — eval can't load a bare adapter dir, so running it
+# would just burn a node. (If SOME merged, continue and eval what's present.)
+NMERGED=$(ls -d runs/*/merged/*/ 2>/dev/null | wc -l | tr -d ' ')
+if [ "${NMERGED:-0}" -eq 0 ]; then
+  echo "=== PIPELINE DONE $(date -u)  (merge=$MRC eval=skipped judge=skipped) ==="
+  echo "!! no merged models produced — aborting before eval. See $MLOG for the merge error."
+  exit 1
+fi
+echo ">>> $NMERGED merged model(s) present — proceeding to eval"
 
 # ---- STAGE 2: generate rollouts (32B merged models at TP=4) ---------------------------
 ELOG="$HOME/vea_eval.log"

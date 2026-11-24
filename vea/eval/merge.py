@@ -73,6 +73,29 @@ def _is_merged(d: Path) -> bool:
         any(d.glob("*.safetensors")) or (d / "pytorch_model.bin").exists())
 
 
+def _sanitize_generation_config(model, clear: bool = False):
+    """Make the model's generation_config valid for save_pretrained.
+
+    Olmo-3's base generation_config.json sets temperature/top_p with do_sample unset, which
+    newer transformers rejects on save ("`temperature` is only used in sample-based modes").
+    We don't use HF generation defaults for eval (vLLM uses explicit SamplingParams), so just
+    make it valid: by default set do_sample=True (keeps the base's intended sampling values);
+    with clear=True, unset the sampling fields entirely (last-resort if validation still trips).
+    """
+    gcfg = getattr(model, "generation_config", None)
+    if gcfg is None:
+        return
+    try:
+        if clear:
+            for f in ("temperature", "top_p", "top_k"):
+                if hasattr(gcfg, f):
+                    setattr(gcfg, f, None)
+        elif getattr(gcfg, "temperature", None) is not None or getattr(gcfg, "top_p", None) is not None:
+            gcfg.do_sample = True
+    except Exception:  # noqa: BLE001 — never let config-tidying block the merge
+        pass
+
+
 def merge_one(base_id: str, adapter_dir: str, out_dir: Path, device: str = "cuda:0"):
     import gc
 
@@ -88,7 +111,14 @@ def merge_one(base_id: str, adapter_dir: str, out_dir: Path, device: str = "cuda
     base = base.to(device)
     model = PeftModel.from_pretrained(base, adapter_dir)
     model = model.merge_and_unload()
-    model.save_pretrained(out_dir, safe_serialization=True)
+    _sanitize_generation_config(model)
+    try:
+        model.save_pretrained(out_dir, safe_serialization=True)
+    except Exception as e:  # noqa: BLE001 — GenerationConfig validation can still trip on save
+        print(f"[merge] save raised {type(e).__name__}: {e}\n        retrying with sampling fields "
+              f"cleared from generation_config", flush=True)
+        _sanitize_generation_config(model, clear=True)
+        model.save_pretrained(out_dir, safe_serialization=True)
     AutoTokenizer.from_pretrained(base_id, trust_remote_code=True).save_pretrained(out_dir)
     del model, base
     gc.collect()
