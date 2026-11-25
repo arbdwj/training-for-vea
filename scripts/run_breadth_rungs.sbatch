@@ -56,6 +56,8 @@ for K in $RUNGS; do
     source scripts/setup_env.sh &&
     [ -f scripts/storage_env.sh ] && source scripts/storage_env.sh &&   # HF cache/runs on scratch (quota)
     export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 &&
+    export PYTORCH_ALLOC_CONF=expandable_segments:True PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True &&   # defragment the CUDA allocator -> fixes the marginal OOM in backward() that killed k2/k4 at ~step 75 (tiny 256MiB allocs failing with ~25GB nominal free = fragmentation, not a true ceiling; k3/k5 survived the identical config)
+    export RAY_TMPDIR=/tmp/ray_\${SLURM_JOB_ID:-\$\$}_k$K && mkdir -p /tmp/ray_\${SLURM_JOB_ID:-\$\$}_k$K &&     # node-local Ray scratch we create ourselves -> fixes k1 dying at ray.init on PermissionError: /local/user/<id> (node-local dir not writable at first srun step)
     python scripts/run.py run '$CONFIG' --stages model --only-k $K
   " > "$LOG" 2>&1
   RC[$K]=$?
@@ -63,7 +65,8 @@ for K in $RUNGS; do
 done
 
 echo "=== SWEEP DONE $(date -u) — adapter audit ==="
+OUT=$(grep -E '^output_dir:' "$CONFIG" | head -1 | awk '{print $2}')   # audit the CONFIG's real output_dir, not a hardcoded one (was runs/breadth_32b_lora -> audited the wrong dir for breadth_32b_100)
 for K in $RUNGS; do
-  CKPT=$(ls runs/breadth_32b_lora/ckpt/k${K}/*/step_*/adapter_model.safetensors 2>/dev/null | tail -1)
+  CKPT=$(ls ${OUT:-runs/breadth_32b_lora}/ckpt/k${K}/*/step_*/adapter_model.safetensors 2>/dev/null | tail -1)
   echo "  k=$K  exit=${RC[$K]:-?}  adapter=${CKPT:-MISSING}"
 done
