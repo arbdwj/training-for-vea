@@ -35,7 +35,7 @@ cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 mkdir -p logs
 
 # env prelude re-sourced inside every step (venv, CUDA, Ray caps, storage, HF offline)
-PRELUDE="cd '$PWD' && source scripts/setup_env.sh && { [ -f scripts/storage_env.sh ] && source scripts/storage_env.sh; } && export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false"
+PRELUDE="cd '$PWD' && source scripts/setup_env.sh && { [ -f scripts/storage_env.sh ] && source scripts/storage_env.sh; } && export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false && export PYTHONPATH=\"$PWD/third_party/open-instruct:\${PYTHONPATH:-}\""
 
 echo "=== node $(hostname)  job ${SLURM_JOB_ID:-none}  config $CONFIG  start $(date -u) ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "!! no GPUs visible"

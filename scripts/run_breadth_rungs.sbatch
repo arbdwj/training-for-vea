@@ -56,6 +56,7 @@ for K in $RUNGS; do
     source scripts/setup_env.sh &&
     [ -f scripts/storage_env.sh ] && source scripts/storage_env.sh &&   # HF cache/runs on scratch (quota)
     export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 &&
+    export PYTHONPATH=\"$PWD/third_party/open-instruct:\${PYTHONPATH:-}\" &&   # make the vendored open_instruct package importable; the editable install broke when the repo was moved. Path is repo-root-relative so this is move-proof.
     export PYTORCH_ALLOC_CONF=expandable_segments:True PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True &&   # defragment the CUDA allocator -> fixes the marginal OOM in backward() that killed k2/k4 at ~step 75 (tiny 256MiB allocs failing with ~25GB nominal free = fragmentation, not a true ceiling; k3/k5 survived the identical config)
     export RAY_TMPDIR=/tmp/ray_\${SLURM_JOB_ID:-\$\$}_k$K && mkdir -p /tmp/ray_\${SLURM_JOB_ID:-\$\$}_k$K &&     # node-local Ray scratch we create ourselves -> fixes k1 dying at ray.init on PermissionError: /local/user/<id> (node-local dir not writable at first srun step)
     python scripts/run.py run '$CONFIG' --stages model --only-k $K
