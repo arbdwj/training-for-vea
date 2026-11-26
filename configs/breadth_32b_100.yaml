@@ -47,7 +47,12 @@ model:                               # STAGE 1 — all 5 rungs, 100 steps each, 
     save_steps: 25                     # intermediate saves (25/50/75/100) -> VEA-vs-step is available
                                        #  later for free; merge/eval auto-pick the highest (step_100).
   cluster:                             # 4-GPU: 3 learners (replicated frozen base) + 1 vLLM engine
-    deepspeed_stage: 2                 # ZeRO-2: base REPLICATED per learner (64GB bf16 < 97GB)
+    deepspeed_stage: 3                 # ZeRO-3: base SHARDED across 3 learners (~21GB each, was 64GB replicated).
+                                       #  ZeRO-2 left ~67.5GB resident per learner -> genuine OOM in backward() at the
+                                       #  margin (k1 died at step_64 even AFTER expandable_segments defragged the allocator;
+                                       #  k3/k5 only cleared stage-2 by luck on activation peaks). Stage 3 frees ~43GB/GPU.
+                                       #  Math-equivalent to ZeRO-2 (same grads/updates) so k3/k5 (done at stage 2) stay
+                                       #  directly comparable; extra all-gather comm largely hides under the vLLM-bound wait.
     deepspeed_offload_param: false
     deepspeed_offload_optimizer: false
     num_learners: 3
